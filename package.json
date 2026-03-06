@@ -1,0 +1,16 @@
+{
+  "name": "agtop",
+  "version": "0.1.0",
+  "description": "Estimate the cost of local Codex and Claude Code sessions",
+  "type": "module",
+  "bin": {
+    "agtop": "./index.js"
+  },
+  "files": [
+    "index.js"
+  ],
+  "engines": {
+    "node": ">=18.3.0"
+  },
+  "license": "MIT"
+}

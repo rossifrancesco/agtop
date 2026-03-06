@@ -1,0 +1,7 @@
+node_modules/
+__pycache__/
+t/
+index_.js
+*.swp
+*.swo
+.DS_Store

@@ -1126,8 +1126,9 @@ async function extractCodexSessionData(sessionFile) {
         const parsed = typeof args === "string" ? JSON.parse(args) : (args || {});
         const detail = extractToolDetail(name, parsed);
         if (!metrics.tool_details[name]) metrics.tool_details[name] = [];
-        if (metrics.tool_details[name].length < MAX_TOOL_DETAILS) {
-          metrics.tool_details[name].push({ d: detail || "(no args)", ts: item.timestamp || "" });
+        metrics.tool_details[name].push({ d: detail || "(no args)", ts: item.timestamp || "" });
+        if (metrics.tool_details[name].length > MAX_TOOL_DETAILS) {
+          metrics.tool_details[name] = metrics.tool_details[name].slice(-MAX_TOOL_DETAILS);
         }
       } catch {}
     } else if (effectiveType === "web_search_call") {
@@ -1277,8 +1278,9 @@ async function extractClaudeSessionData(transcriptPath) {
           const input = block.input || {};
           const detail = extractToolDetail(name, input);
           if (!metrics.tool_details[name]) metrics.tool_details[name] = [];
-          if (metrics.tool_details[name].length < MAX_TOOL_DETAILS) {
-            metrics.tool_details[name].push({ d: detail || "(no args)", ts: item.timestamp || "" });
+          metrics.tool_details[name].push({ d: detail || "(no args)", ts: item.timestamp || "" });
+          if (metrics.tool_details[name].length > MAX_TOOL_DETAILS) {
+            metrics.tool_details[name] = metrics.tool_details[name].slice(-MAX_TOOL_DETAILS);
           }
 
           // Web fetch/search extraction
@@ -1947,7 +1949,9 @@ function boxLine(content, width, highlight) {
   // visible: │ + space + inner + space + │ = width
   const inner = width - 4;
   const clipped = ansiSlice(content, 0, inner);
-  return bc + BOX.v + RESET + " " + clipped + " " + bc + BOX.v + RESET;
+  const vLen = ansiLen(clipped);
+  const pad = Math.max(0, inner - vLen);
+  return bc + BOX.v + RESET + " " + clipped + " ".repeat(pad) + " " + bc + BOX.v + RESET;
 }
 
 /** Render an empty box-bordered line */
@@ -2766,6 +2770,20 @@ function costColor(value) {
   return C.costRed;
 }
 
+/** Count visible (non-ANSI) character length of a string. */
+function ansiLen(str) {
+  let len = 0;
+  for (let i = 0; i < str.length; ) {
+    if (str[i] === "\x1b") {
+      const mEnd = str.indexOf("m", i);
+      if (mEnd !== -1) { i = mEnd + 1; continue; }
+    }
+    len++;
+    i++;
+  }
+  return len;
+}
+
 /** Slice an ANSI-colored string by visible column range [start, start+len). */
 function ansiSlice(str, start, len) {
   let vis = 0;       // visible column position
@@ -3515,8 +3533,8 @@ function renderAgentPanel(session, data, panelW, rows, state) {
     return lines;
   }
 
-  // Build sorted tool list (by count descending)
-  const toolList = Object.entries(m.tools).sort((a, b) => b[1] - a[1]);
+  // Build sorted tool list (by count descending), with "All" virtual entry at index 0
+  const toolList = [["*All", m.tool_count], ...Object.entries(m.tools).sort((a, b) => b[1] - a[1])];
 
   // Ensure selected tab is valid
   if (state.agentToolTab >= toolList.length) state.agentToolTab = 0;
@@ -3559,17 +3577,46 @@ function renderAgentPanel(session, data, panelW, rows, state) {
   const contentW = panelW - 4 - AGENT_TAB_WIDTH - 1; // inner width minus tab sidebar minus separator
   const HOME = process.env.HOME || "";
 
+  // Compute per-tool live counts (entries since agtop started)
+  const startTime = state._startTime || "";
+  const liveCountByTool = {};
+  if (state.agentLiveFilter && m.tool_details) {
+    let allLive = 0;
+    for (const [tName] of toolList) {
+      if (tName === "*All") continue;
+      const details = m.tool_details[tName] || [];
+      const cnt = details.filter(e => {
+        const ts = typeof e === "string" ? "" : (e.ts || "");
+        return ts >= startTime;
+      }).length;
+      liveCountByTool[tName] = cnt;
+      allLive += cnt;
+    }
+    liveCountByTool["*All"] = allLive;
+  }
+
   // Selected tool details — sorted chronologically (oldest first, newest at bottom)
   const [toolName, toolCount] = toolList[state.agentToolTab];
-  const rawDetails = (m.tool_details && m.tool_details[toolName]) || [];
+  const isAllTab = toolName === "*All";
+  let rawDetails;
+  if (isAllTab && m.tool_details) {
+    // Merge all tool details with tool name tag
+    rawDetails = [];
+    for (const [tName, entries] of Object.entries(m.tool_details)) {
+      for (const e of entries) {
+        rawDetails.push({ d: typeof e === "string" ? e : (e.d || ""), ts: typeof e === "string" ? "" : (e.ts || ""), _tool: tName });
+      }
+    }
+  } else {
+    rawDetails = ((m.tool_details && m.tool_details[toolName]) || []).map(e => ({ ...e, _tool: toolName }));
+  }
   const allSorted = [...rawDetails].sort((a, b) => {
-    const ta = typeof a === "string" ? "" : (a.ts || "");
-    const tb = typeof b === "string" ? "" : (b.ts || "");
+    const ta = a.ts || "";
+    const tb = b.ts || "";
     return ta < tb ? -1 : ta > tb ? 1 : 0;
   });
 
   // Apply live filter if active
-  const startTime = state._startTime || "";
   const sorted = state.agentLiveFilter
     ? allSorted.filter(e => {
         const ts = typeof e === "string" ? "" : (e.ts || "");
@@ -3630,14 +3677,18 @@ function renderAgentPanel(session, data, panelW, rows, state) {
       state._agentDownArrowRow = r;
     } else if (tabIdx < toolList.length) {
       const [tName, tCount] = toolList[tabIdx];
+      const displayCount = state.agentLiveFilter ? (liveCountByTool[tName] || 0) : tCount;
       const isActive = tabIdx === state.agentToolTab;
       const isHover = tabIdx === state.hoverAgentToolTab;
       const flashTs = state._agentToolFlash[tName] || 0;
       const isFlashing = flashTs && (now - flashTs < FLASH_DURATION);
+      // Highlight tools with recent activity (within last interval)
+      const hasRecentActivity = isFlashing;
 
       // Format: " Name   42 " (fixed width)
-      const shortName = tName.replace(/^mcp__/, "");
-      const countStr = String(tCount);
+      const isAllEntry = tName === "*All";
+      const shortName = isAllEntry ? "All" : tName.replace(/^mcp__/, "");
+      const countStr = String(displayCount);
       const maxNameLen = AGENT_TAB_WIDTH - countStr.length - 3; // space + name + space + count + space
       const trimName = shortName.length > maxNameLen ? shortName.slice(0, maxNameLen - 1) + "…" : shortName;
       const pad = " ".repeat(Math.max(0, maxNameLen - trimName.length));
@@ -3646,11 +3697,14 @@ function renderAgentPanel(session, data, panelW, rows, state) {
       const countStyle = isFlashing ? "\x1b[1;38;5;114m" : C.hdrDim;
 
       if (isActive) {
-        line += " \x1b[1;38;5;255m" + trimName + RESET + pad + " " + countStyle + countStr + RESET + " ";
+        const nameStyle = hasRecentActivity ? "\x1b[1;38;5;114m" : "\x1b[1;38;5;255m";
+        line += " " + nameStyle + trimName + RESET + pad + " " + countStyle + countStr + RESET + " ";
       } else if (isHover) {
-        line += " \x1b[4;38;5;250m" + trimName + RESET + pad + " " + countStyle + countStr + RESET + " ";
+        const nameStyle = hasRecentActivity ? "\x1b[4;38;5;114m" : "\x1b[4;38;5;250m";
+        line += " " + nameStyle + trimName + RESET + pad + " " + countStyle + countStr + RESET + " ";
       } else {
-        line += " \x1b[38;5;245m" + trimName + RESET + pad + " " + countStyle + countStr + RESET + " ";
+        const nameStyle = hasRecentActivity ? "\x1b[38;5;114m" : "\x1b[38;5;245m";
+        line += " " + nameStyle + trimName + RESET + pad + " " + countStyle + countStr + RESET + " ";
       }
 
       // Store for click detection
@@ -3714,12 +3768,25 @@ function renderAgentPanel(session, data, panelW, rows, state) {
       const icon = copyFlash ? `\x1b[38;5;114m✓${RESET}` : `\x1b[38;5;60m⧉${RESET}`;
       state._agentCopyTargets.push({ row: r, value: rawDetail });
 
+      // Tool name prefix for "All" view
+      const entryTool = isAllTab ? (entry._tool || "") : "";
+      const toolLabel = entryTool ? entryTool.replace(/^mcp__[^_]+__/, "mcp:") : "";
+      const toolLabelW = toolLabel ? toolLabel.length + 1 : 0; // +1 trailing space
+
       const tsW = tsLabel ? tsLabel.length + 1 : 0; // +1 for trailing space
       const iconW = 2; // icon char may be double-width in some fonts
-      const availW = contentW - 3 - tsW - iconW; // space + ts + text + space + icon
+      const availW = contentW - 3 - tsW - toolLabelW - iconW; // space + ts + toolLabel + text + space + icon
       if (display.length > availW) display = display.slice(0, Math.max(0, availW - 1)) + "…";
       line += " ";
       if (tsLabel) line += C.dimText + tsLabel + RESET + " ";
+      if (toolLabel) {
+        // Stable color per tool name (cycle through palette)
+        const TOOL_COLORS = [75, 114, 173, 180, 139, 109, 146, 215, 152, 167];
+        let hash = 0;
+        for (let c = 0; c < entryTool.length; c++) hash = ((hash << 5) - hash + entryTool.charCodeAt(c)) | 0;
+        const colorIdx = ((hash % TOOL_COLORS.length) + TOOL_COLORS.length) % TOOL_COLORS.length;
+        line += `\x1b[38;5;${TOOL_COLORS[colorIdx]}m` + toolLabel + RESET + " ";
+      }
       line += C.hdrValue + display + RESET;
       const textLen = display.length;
       const fillLen = Math.max(0, availW - textLen);
@@ -3731,7 +3798,14 @@ function renderAgentPanel(session, data, panelW, rows, state) {
     lines.push(line);
   }
 
-  return lines.slice(0, rows);
+  // Clip all lines to panel inner width to prevent overflow
+  const maxW = panelW - 4;
+  return lines.slice(0, rows).map(l => {
+    const vLen = ansiLen(l);
+    if (vLen > maxW) return ansiSlice(l, 0, maxW);
+    if (vLen < maxW) return l + " ".repeat(maxW - vLen);
+    return l;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -4727,6 +4801,7 @@ function handleEvent(event, state) {
             state.agentLiveFilter = !state.agentLiveFilter;
             state.agentToolScroll = -1;
             state.dirty = true;
+            saveUiPrefs({ bottomTab: state.bottomTab, listTab: state.listTab, tabSort: state._tabSort, agentLiveFilter: state.agentLiveFilter });
             return;
           }
         }
@@ -5348,6 +5423,7 @@ async function main() {
   const _savedPrefs = loadUiPrefs();
   if (typeof _savedPrefs.bottomTab === "number") state.bottomTab = _savedPrefs.bottomTab;
   if (typeof _savedPrefs.listTab === "number") state.listTab = _savedPrefs.listTab;
+  if (typeof _savedPrefs.agentLiveFilter === "boolean") state.agentLiveFilter = _savedPrefs.agentLiveFilter;
   if (Array.isArray(_savedPrefs.tabSort)) {
     for (let i = 0; i < _savedPrefs.tabSort.length && i < state._tabSort.length; i++) {
       const s = _savedPrefs.tabSort[i];

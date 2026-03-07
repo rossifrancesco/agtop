@@ -204,13 +204,7 @@ function parseCliArgs() {
       `agtop — an htop-like monitor for AI coding agent sessions
 
 Tracks Claude Code and Codex sessions running on your machine, showing
-real-time cost, token usage, tool invocations, and OS-level metrics.
-
-USAGE
-  agtop                  Launch interactive TUI
-  agtop -l               List all sessions (table format)
-  agtop -j               Dump all sessions as JSON (for scripting)
-  agtop -j | jq .        Pipe to jq for filtering/analysis
+real-time cost estimation, token usage, tool invocations, and OS-level metrics.
 
 OPTIONS
   -l, --list             List sessions in a table and exit
@@ -237,8 +231,14 @@ MOUSE
   Click session rows, column headers, tabs, and menu bar items.
   Hover over column headers for descriptions.
 
+COST ESTIMATION
+  Cost figures are estimates based on per-token API pricing from the LiteLLM
+  database (cached locally for 24 hours). Many subscription plans — such as
+  Claude Max, Pro, or Team — charge a flat rate or bundle tokens differently,
+  so reported costs may not reflect your actual bill. Use the $ column as a
+  rough indicator of resource consumption, not as an authoritative invoice.
+
 NOTES
-  Pricing data is fetched from LiteLLM and cached for 24 hours.
   Session data is read from ~/.claude/projects/ and ~/.codex/sessions/.
   UI preferences (active tab, sort order, filters) persist across runs.
 `
@@ -2210,7 +2210,7 @@ const COL_TOKENS = {
   compare: (a, b) => ((a.list_input_tokens || 0) + (a.list_output_tokens || 0)) - ((b.list_input_tokens || 0) + (b.list_output_tokens || 0)),
 };
 const COL_COST = {
-  key: "cost", label: "$", width: 9, align: "right", desc: "Estimated session cost (USD)",
+  key: "cost", label: "$", width: 9, align: "right", desc: "Estimated cost based on per-token API pricing (LiteLLM).\nMany plans (Max, Pro, Team) are flat-rate or bundled,\nso actual billing may differ significantly.",
   render: (s) => compactUsd(s.list_total_cost),
   compare: (a, b) => {
     const ca = a.list_total_cost === "included" ? -1 : parseFloat(a.list_total_cost || 0);
@@ -2229,7 +2229,7 @@ const COL_TOK_RATE = {
   compare: (a, b) => (a.list_tokens_per_min || 0) - (b.list_tokens_per_min || 0),
 };
 const COL_COST_RATE = {
-  key: "cost_rate", label: "$/m", width: 6, align: "right", desc: "Cost rate (USD per minute, EMA)",
+  key: "cost_rate", label: "$/m", width: 6, align: "right", desc: "Estimated cost rate (USD/min, EMA-smoothed).\nBased on per-token API pricing; flat-rate plans\n(Max, Pro, Team) are billed differently.",
   render: (s) => s.list_cost_per_min > 0.001 ? `$${s.list_cost_per_min.toFixed(2)}` : "",
   compare: (a, b) => (a.list_cost_per_min || 0) - (b.list_cost_per_min || 0),
 };
@@ -3993,6 +3993,11 @@ function renderHelpView(width, height) {
   lines.push("    Scroll wheel     Scroll up/down");
   lines.push("    Shift+drag       Select text for copy");
   lines.push("");
+  lines.push(BOLD + "  Cost estimation:" + RESET);
+  lines.push("    Costs are estimates based on per-token API pricing (LiteLLM).");
+  lines.push("    Flat-rate plans (Max, Pro, Team) are billed differently, so");
+  lines.push("    reported costs may not match your actual bill.");
+  lines.push("");
   lines.push(C.dimText + "  Press any key to return" + RESET);
 
   while (lines.length < height - 1) lines.push("");
@@ -4301,20 +4306,23 @@ function render(state) {
       const cpos = columnScreenPos(state._hoverColKey, state.hScroll, state);
       if (cpos) {
         const label = col.label.trim() || "Status";
-        const body = col.desc;
-        const inner = label + ": " + body;
-        const tipW = inner.length + 4; // 2 border + 2 padding
+        const descLines = col.desc.split("\n");
+        const tipBorder = "\x1b[38;5;60;48;5;236m";
+        const tipLabel = "\x1b[1;38;5;75;48;5;236m";
+        const tipText = "\x1b[38;5;252;48;5;236m";
+        const headerStr = label + ": " + descLines[0];
+        const maxLen = Math.max(headerStr.length, ...descLines.slice(1).map(l => l.length));
+        const tipW = maxLen + 4;
         const tipX = Math.max(0, Math.min(cpos.x, width - tipW));
-        const tipRow = state._colHeaderRow; // 0-based index = row below header
-        const tipBg = "\x1b[48;5;236m"; // dark gray bg
-        const tipBorder = "\x1b[38;5;60;48;5;236m"; // muted blue-gray border on dark bg
-        const tipLabel = "\x1b[1;38;5;75;48;5;236m"; // bold blue label
-        const tipText = "\x1b[38;5;252;48;5;236m"; // light gray text
-        // 3 lines: top border, content, bottom border
-        const topLine    = tipBorder + "╭" + "─".repeat(tipW - 2) + "╮" + RESET;
-        const contentLine = tipBorder + "│" + RESET + tipLabel + " " + label + ": " + RESET + tipText + body + " ".repeat(Math.max(0, tipW - inner.length - 4)) + " " + RESET + tipBorder + "│" + RESET;
-        const botLine    = tipBorder + "╰" + "─".repeat(tipW - 2) + "╯" + RESET;
-        const tipLines = [topLine, contentLine, botLine];
+        const tipRow = state._colHeaderRow;
+        const topLine = tipBorder + "╭" + "─".repeat(tipW - 2) + "╮" + RESET;
+        const firstLine = tipBorder + "│" + RESET + tipLabel + " " + label + ": " + RESET + tipText + descLines[0] + " ".repeat(Math.max(0, maxLen - headerStr.length)) + " " + RESET + tipBorder + "│" + RESET;
+        const tipLines = [topLine, firstLine];
+        for (let di = 1; di < descLines.length; di++) {
+          const dl = descLines[di];
+          tipLines.push(tipBorder + "│" + RESET + tipText + " " + dl + " ".repeat(Math.max(0, maxLen - dl.length)) + " " + RESET + tipBorder + "│" + RESET);
+        }
+        tipLines.push(tipBorder + "╰" + "─".repeat(tipW - 2) + "╯" + RESET);
         for (let t = 0; t < tipLines.length; t++) {
           const row = tipRow + t;
           if (row >= screenLines.length) break;
@@ -5483,6 +5491,8 @@ async function main() {
       state.agentToolTab = 0;
       state.agentToolScroll = -1;
       state.agentTabScroll = 0;
+      state._agentToolCounts = {};
+      state._agentToolFlash = {};
       render(state);
       state.dirty = false;
       state.panelData = await safeExtractSessionData(panelSel);

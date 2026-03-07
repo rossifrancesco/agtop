@@ -25,7 +25,7 @@ import {
 import { createInterface } from "node:readline";
 import { join, basename, dirname, sep } from "node:path";
 import { homedir } from "node:os";
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -2316,6 +2316,143 @@ function activeColumns(state) {
 const COLUMNS = SUMMARY_COLUMNS;
 
 // ---------------------------------------------------------------------------
+// Quota: fetch usage limits from provider APIs
+// ---------------------------------------------------------------------------
+
+const QUOTA_TTL_MS = 30_000; // refetch every 30s
+const QUOTA_INTERVAL_TICKS = 5; // only attempt every 5th loadSessions tick
+let _quotaCache = { ts: 0, fetched: false, claude: null, codex: null };
+
+/**
+ * Read Claude credential from macOS keychain or ~/.claude/.credentials.json.
+ * Returns { type: "oauth", token } | { type: "api_key" } | { type: "none" }.
+ */
+function readClaudeCredential() {
+  // Try keychain first (macOS)
+  if (process.platform === "darwin") {
+    try {
+      const raw = execSync(
+        'security find-generic-password -s "Claude Code" -w 2>/dev/null',
+        { encoding: "utf-8", timeout: 3000 }
+      ).trim();
+      if (raw) {
+        if (raw.startsWith("sk-ant-")) return { type: "api_key" };
+        return { type: "oauth", token: raw };
+      }
+    } catch { /* not in keychain or not macOS */ }
+  }
+  // Fallback: credentials file
+  try {
+    const credPath = join(homedir(), ".claude", ".credentials.json");
+    const cred = JSON.parse(readFileSync(credPath, "utf-8"));
+    const tok = cred.accessToken || cred.access_token;
+    if (tok) {
+      if (tok.startsWith("sk-ant-")) return { type: "api_key" };
+      return { type: "oauth", token: tok };
+    }
+  } catch { /* no file */ }
+  return { type: "none" };
+}
+
+/**
+ * Read Codex access token from ~/.codex/auth.json
+ */
+function readCodexToken() {
+  try {
+    const authPath = join(process.env.CODEX_HOME || join(homedir(), ".codex"), "auth.json");
+    const auth = JSON.parse(readFileSync(authPath, "utf-8"));
+    if (auth.tokens && auth.tokens.access_token) return auth.tokens.access_token;
+    if (auth.access_token) return auth.access_token;
+  } catch { /* no file */ }
+  return null;
+}
+
+/**
+ * Fetch Claude usage quota via OAuth API.
+ * Returns { provider, ... quota windows } | { provider, api_billing } | null.
+ */
+async function fetchClaudeQuota() {
+  const cred = readClaudeCredential();
+  if (cred.type === "api_key") return { provider: "claude", api_billing: true };
+  if (cred.type === "none") return null;
+  const token = cred.token;
+  try {
+    const resp = await fetch("https://api.anthropic.com/api/oauth/usage", {
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "anthropic-beta": "oauth-2025-04-20",
+      },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    // Normalize: each window has { utilization: 0-1, resets_at: ISO|epoch }
+    const result = { provider: "claude" };
+    for (const key of ["five_hour", "seven_day", "seven_day_sonnet", "seven_day_opus", "extra_usage"]) {
+      if (data[key] && typeof data[key].utilization === "number") {
+        result[key] = {
+          pct: Math.round(data[key].utilization * 100),
+          resets_at: data[key].resets_at || null,
+        };
+      }
+    }
+    if (data.rate_limit_tier) result.plan = data.rate_limit_tier;
+    return Object.keys(result).length > 1 ? result : null;
+  } catch { return null; }
+}
+
+/**
+ * Fetch Codex usage quota via ChatGPT backend API.
+ * Returns { plan_type, primary_window, secondary_window } or null.
+ */
+async function fetchCodexQuota() {
+  const token = readCodexToken();
+  if (!token) return null;
+  try {
+    const resp = await fetch("https://chatgpt.com/backend-api/wham/usage", {
+      headers: { "Authorization": `Bearer ${token}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    if (!data.rate_limit) return null;
+    const result = { provider: "codex" };
+    if (data.plan_type) result.plan = data.plan_type;
+    const rl = data.rate_limit;
+    if (rl.primary_window) {
+      result.primary = {
+        pct: rl.primary_window.used_percent || 0,
+        resets_at: rl.primary_window.reset_at || null,
+        window_secs: rl.primary_window.limit_window_seconds || 18000,
+      };
+    }
+    if (rl.secondary_window) {
+      result.secondary = {
+        pct: rl.secondary_window.used_percent || 0,
+        resets_at: rl.secondary_window.reset_at || null,
+        window_secs: rl.secondary_window.limit_window_seconds || 604800,
+      };
+    }
+    result.limit_reached = rl.limit_reached || false;
+    return result;
+  } catch { return null; }
+}
+
+/**
+ * Fetch quota for all providers. Cached with TTL.
+ */
+async function fetchQuota() {
+  const now = Date.now();
+  if (now - _quotaCache.ts < QUOTA_TTL_MS) return _quotaCache;
+  const [claude, codex] = await Promise.all([
+    fetchClaudeQuota().catch(() => null),
+    fetchCodexQuota().catch(() => null),
+  ]);
+  _quotaCache = { ts: now, fetched: true, claude: claude || _quotaCache.claude, codex: codex || _quotaCache.codex };
+  return _quotaCache;
+}
+
+// ---------------------------------------------------------------------------
 // Tier 2: OS process metrics (posix backend)
 // ---------------------------------------------------------------------------
 
@@ -2641,6 +2778,8 @@ function createState() {
     _agentToolFlash: {}, // {toolName: timestamp} for count-change flash
     _hoverAgentArrow: "", // "up" or "down" or ""
     _hoverColKey: null, // column key being hovered on header row
+    _quota: { ts: 0, fetched: false, claude: null, codex: null }, // provider quota data
+    _quotaTick: QUOTA_INTERVAL_TICKS - 1, // fetch on first tick
   };
 }
 
@@ -2871,7 +3010,7 @@ function updateOverviewHistory(stats) {
   pushGlobalHistory(_globalMemHist, (stats.totalMemory || 0) / (1024 * 1024));
 }
 
-function renderHeader(stats, width) {
+function renderHeader(stats, width, state) {
   const lines = [];
   lines.push(boxTop(width, "Overview"));
 
@@ -2889,7 +3028,7 @@ function renderHeader(stats, width) {
   // Row 1: Spend + CPU
   const spendLabel = `${C.hdrLabel}Total Spend${RESET} ${C.hdrYellow}$${curSpend.toFixed(2)}${RESET}`;
   const spendChart = renderSparkline(_globalSpendDeltaHist, chartW, 0, "spend", "dots");
-  const cpuLabel = `${C.hdrLabel}Total CPU${RESET} ${C.hdrValue}${stats.totalCpu}%${RESET}`;
+  const cpuLabel = `${C.hdrLabel}Agents CPU${RESET} ${C.hdrValue}${stats.totalCpu}%${RESET}`;
   const cpuChart = renderSparkline(_globalCpuHist, chartW, 100, "cpu", "dots");
   const row1Left = buildOverviewCell(spendLabel, spendChart, labelW, chartW, colW);
   const row1Right = buildOverviewCell(cpuLabel, cpuChart, labelW, chartW, colW);
@@ -2898,10 +3037,71 @@ function renderHeader(stats, width) {
   // Row 2: Tokens + Memory
   const tokLabel = `${C.hdrLabel}Total Tokens${RESET} ${C.hdrValue}${compactTokens(curTokens)}${RESET}`;
   const tokChart = renderSparkline(_globalTokenDeltaHist, chartW, 0, "spend", "dots");
-  const memLabel = `${C.hdrLabel}Total Mem${RESET} ${C.hdrValue}${memMB.toFixed(0)} MB${RESET}`;
+  const memLabel = `${C.hdrLabel}Agents Mem${RESET} ${C.hdrValue}${memMB.toFixed(0)} MB${RESET}`;
   const row2Left = buildOverviewCell(tokLabel, tokChart, labelW, chartW, colW);
   const row2Right = buildOverviewCell(memLabel, "", labelW, 0, colW);
   lines.push(boxLine(row2Left + " ".repeat(gap) + row2Right, width));
+
+  lines.push(boxBottom(width));
+  return lines;
+}
+
+/** Render the Limits box below Overview showing account-wide quota for each provider */
+function renderLimitsPanel(width, state) {
+  const quota = state && state._quota;
+  if (!quota) return [];
+
+  const lines = [];
+  lines.push(boxTop(width, "Limits"));
+
+  const inner = width - 4;
+  const gap = 2;
+  const colW = Math.floor((inner - gap) / 2);
+
+  function quotaCell(provLabel, q) {
+    if (!q) {
+      if (!quota.fetched) return `${C.hdrLabel}${provLabel}${RESET} ${C.dimText}...${RESET}`;
+      return `${C.hdrLabel}${provLabel}${RESET} ${C.dimText}no credentials${RESET}`;
+    }
+    if (q.api_billing) {
+      return `${C.hdrLabel}${provLabel}${RESET} ${C.dimText}API billing, no limits${RESET}`;
+    }
+    const windows = [];
+    if (q.five_hour) windows.push({ label: "5h", pct: q.five_hour.pct, reset: q.five_hour.resets_at });
+    if (q.seven_day) windows.push({ label: "7d", pct: q.seven_day.pct, reset: q.seven_day.resets_at });
+    if (q.primary) windows.push({ label: "5h", pct: q.primary.pct, reset: q.primary.resets_at });
+    if (q.secondary) windows.push({ label: "7d", pct: q.secondary.pct, reset: q.secondary.resets_at });
+    const planStr = q.plan ? ` ${C.dimText}(${q.plan})${RESET}` : "";
+    let parts = `${C.hdrLabel}${provLabel}${RESET}${planStr}`;
+    for (const w of windows) {
+      const color = w.pct >= 90 ? C.costRed : w.pct >= 70 ? C.costYellow : C.chartBarLow;
+      const barW = 8;
+      const filled = Math.round((w.pct / 100) * barW);
+      let bar = "";
+      for (let b = 0; b < barW; b++) {
+        bar += (b < filled ? color + "━" : "\x1b[38;5;244m─") + RESET;
+      }
+      let resetStr = "";
+      if (w.reset) {
+        const resetMs = w.reset > 1e12 ? w.reset : w.reset * 1000;
+        const diffMs = resetMs - Date.now();
+        if (diffMs > 0) {
+          const h = Math.floor(diffMs / 3600_000);
+          const m = Math.floor((diffMs % 3600_000) / 60_000);
+          resetStr = ` ${C.dimText}${h}h${String(m).padStart(2, "0")}m${RESET}`;
+        }
+      }
+      parts += ` ${C.hdrLabel}${w.label}${RESET} ${color}${String(w.pct).padStart(3)}%${RESET}${bar}${resetStr}`;
+    }
+    if (q.limit_reached) parts += ` ${C.costRed}⚠ limit${RESET}`;
+    return parts;
+  }
+
+  const leftCell = quotaCell("Claude", quota.claude);
+  const rightCell = quotaCell("Codex", quota.codex);
+  const leftPlain = leftCell.replace(/\x1b\[[^m]*m/g, "");
+  const leftPad = Math.max(1, colW - leftPlain.length);
+  lines.push(boxLine(leftCell + " ".repeat(leftPad) + " ".repeat(gap) + rightCell, width));
 
   lines.push(boxBottom(width));
   return lines;
@@ -4189,14 +4389,18 @@ function render(state) {
   const boxW = width - 1;
 
   // Overview panel (top)
-  const headerLines = renderHeader(state.stats || computeStats([]), boxW);
+  const headerLines = renderHeader(state.stats || computeStats([]), boxW, state);
+  const limitsLines = renderLimitsPanel(boxW, state);
 
   // Collect all screen lines
   const screenLines = [];
   for (const line of headerLines) screenLines.push(line);
+  for (const line of limitsLines) screenLines.push(line);
+  const topPanelLines = headerLines.length + limitsLines.length;
+  state.headerLines = topPanelLines; // update for mouse position calculations
 
   // Bottom panels height (adaptive)
-  const usedByHeader = headerLines.length;
+  const usedByHeader = topPanelLines;
   const totalBody = height - usedByHeader - 1; // -1 footer
   const rawPanelH = Math.min(MAX_PANEL, Math.max(MIN_PANEL, Math.floor(totalBody * 0.4)));
   const panelHeight = Math.min(rawPanelH, Math.max(3, totalBody - 5)); // ensure list gets at least 5 rows
@@ -5178,6 +5382,15 @@ async function loadSessions(state) {
   await annotateListCosts(codexSessions, state.codexPlan);
   await annotateListCosts(claudeSessions, state.claudePlan);
   state.sessions = [...codexSessions, ...claudeSessions];
+
+  // Quota: fetch provider usage limits periodically
+  state._quotaTick = (state._quotaTick || 0) + 1;
+  if (state._quotaTick >= QUOTA_INTERVAL_TICKS) {
+    state._quotaTick = 0;
+    try {
+      state._quota = await fetchQuota();
+    } catch { /* best effort */ }
+  }
 
   // Tier 2: collect OS process metrics periodically
   state._tier2Tick = (state._tier2Tick || 0) + 1;

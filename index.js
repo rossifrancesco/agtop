@@ -25,7 +25,7 @@ import {
 } from "node:fs";
 import { createInterface } from "node:readline";
 import { join, basename, dirname, sep } from "node:path";
-import { homedir } from "node:os";
+import { homedir, cpus } from "node:os";
 import { spawn, execSync } from "node:child_process";
 
 // ---------------------------------------------------------------------------
@@ -2818,8 +2818,135 @@ function lsofLookup(pids) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Windows backend: PowerShell-based process snapshot
+// ---------------------------------------------------------------------------
+
+// Tracks previous CPU time (100ns units) per PID for delta-based CPU%.
+const _winPrevCpu = new Map(); // pid → { cpuTime, ts }
+
+function psSnapshotWindows() {
+  // Single PowerShell call: get all processes with ppid, cmdline, memory, cpu time.
+  const script =
+    "Get-CimInstance Win32_Process " +
+    "| Select-Object ProcessId,ParentProcessId,CommandLine,WorkingSetSize,KernelModeTime,UserModeTime " +
+    "| ConvertTo-Json -Compress -Depth 1";
+  return new Promise((resolve) => {
+    const proc = spawn(
+      "powershell",
+      ["-NoProfile", "-NonInteractive", "-Command", script],
+      { stdio: ["ignore", "pipe", "ignore"] }
+    );
+    let out = "";
+    proc.stdout.on("data", (d) => { out += d; });
+    proc.on("close", () => {
+      try {
+        const raw = JSON.parse(out.trim());
+        const arr = Array.isArray(raw) ? raw : [raw];
+        const procs = new Map(); // pid → { ppid, args, memory, cpu }
+        const now = Date.now();
+        const numCpus = cpus().length || 1;
+        for (const p of arr) {
+          const pid = p.ProcessId;
+          if (!pid || pid <= 0) continue;
+          const cpuTime = (p.KernelModeTime || 0) + (p.UserModeTime || 0);
+          const prev = _winPrevCpu.get(pid);
+          let cpu = 0;
+          if (prev && now > prev.ts) {
+            // cpuTime is in 100ns units; convert delta to ms: * 0.0001
+            const dtMs = now - prev.ts;
+            const dtCpu = Math.max(0, cpuTime - prev.cpuTime);
+            cpu = Math.min(100, (dtCpu * 0.0001 / dtMs / numCpus) * 100);
+          }
+          _winPrevCpu.set(pid, { cpuTime, ts: now });
+          procs.set(pid, {
+            ppid: p.ParentProcessId || 0,
+            args: p.CommandLine || "",
+            memory: p.WorkingSetSize || 0,
+            cpu,
+          });
+        }
+        resolve(procs);
+      } catch {
+        resolve(new Map());
+      }
+    });
+    proc.on("error", () => resolve(new Map()));
+  });
+}
+
+async function collectProcessMetricsWindows(sessions) {
+  const snapshot = await psSnapshotWindows();
+  if (snapshot.size === 0) return new Map();
+
+  // Build childrenByPpid
+  const childrenByPpid = new Map();
+  for (const [pid, info] of snapshot) {
+    const list = childrenByPpid.get(info.ppid);
+    if (list) list.push(pid);
+    else childrenByPpid.set(info.ppid, [pid]);
+  }
+
+  // Identify Claude/Codex root processes and map to session UUID via --resume arg.
+  // Fall back to cwd-based matching if no UUID in args.
+  const rootPids = new Map(); // sessionKey → rootPid
+
+  // Build cwd→session lookup for fallback
+  const cwdToSession = new Map();
+  for (const s of sessions) {
+    if (!s.label_source) continue;
+    const existing = cwdToSession.get(s.label_source);
+    if (!existing || (s.last_active && (!existing.last_active || s.last_active > existing.last_active))) {
+      cwdToSession.set(s.label_source, s);
+    }
+  }
+
+  for (const [pid, info] of snapshot) {
+    const args = info.args || "";
+    const isClaudeProc = CLAUDE_CMD_RE.test(args);
+    const isCodexProc  = CODEX_CMD_RE.test(args);
+    if (!isClaudeProc && !isCodexProc) continue;
+    if (DAEMON_RE.test(args)) continue;
+
+    const provider = isCodexProc ? "codex" : "claude";
+    const resumeMatch = args.match(RESUME_UUID_RE);
+    if (resumeMatch) {
+      rootPids.set(`${provider}:${resumeMatch[1]}`, pid);
+    } else {
+      // On Windows, extract CWD from CommandLine heuristic or skip — no lsof available.
+      // Try matching by project path in the command line itself.
+      for (const [cwd, session] of cwdToSession) {
+        if (args.includes(cwd)) {
+          const key = `${session.provider}:${session.session_id}`;
+          if (!rootPids.has(key)) rootPids.set(key, pid);
+          break;
+        }
+      }
+    }
+  }
+
+  // BFS descendants + aggregate cpu/memory per session
+  const result = new Map();
+  for (const [key, rootPid] of rootPids) {
+    const pids = bfsDescendants(rootPid, childrenByPpid);
+    let totalCpu = 0, totalMemory = 0;
+    for (const pid of pids) {
+      const u = snapshot.get(pid);
+      if (u) { totalCpu += u.cpu; totalMemory += u.memory; }
+    }
+    const rootInfo = snapshot.get(rootPid);
+    result.set(key, {
+      pids: pids.size,
+      cpu: Math.round(totalCpu * 10) / 10,
+      memory: totalMemory,
+      command: rootInfo ? rootInfo.args : "",
+    });
+  }
+  return result;
+}
+
 async function collectProcessMetrics(sessions) {
-  if (process.platform === "win32") return new Map();
+  if (process.platform === "win32") return collectProcessMetricsWindows(sessions);
   _orphanProcessInfo.clear();
 
   const snapshot = await psSnapshot();
@@ -6169,7 +6296,7 @@ async function loadSessions(state) {
 
   // Tier 2: collect OS process metrics periodically
   state._tier2Tick = (state._tier2Tick || 0) + 1;
-  if (process.platform !== "win32" && state._tier2Tick >= TIER2_INTERVAL_TICKS) {
+  if (state._tier2Tick >= TIER2_INTERVAL_TICKS) {
     state._tier2Tick = 0;
     try {
       state._processMetrics = await collectProcessMetrics(state.sessions);

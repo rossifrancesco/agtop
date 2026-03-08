@@ -5519,16 +5519,34 @@ function tabAtX(col) {
   return -1;
 }
 
-/** Copy text to system clipboard. Uses pbcopy on macOS, OSC 52 as fallback. */
+/** Copy text to system clipboard. Platform-native first, OSC 52 as fallback. */
 function copyToClipboard(text) {
   if (process.platform === "darwin") {
     try {
-      const { execSync } = require("child_process");
       execSync("pbcopy", { input: text, stdio: ["pipe", "ignore", "ignore"] });
       return;
     } catch {}
+  } else if (process.platform === "win32") {
+    try {
+      // `clip` is built-in on all Windows versions; requires UTF-16LE input.
+      execSync("clip", { input: Buffer.from(text, "utf16le"), stdio: ["pipe", "ignore", "ignore"] });
+      return;
+    } catch {}
+  } else {
+    // Linux: try Wayland (wl-copy) then X11 (xclip / xsel)
+    const cmds = [
+      ["wl-copy"],
+      ["xclip", "-selection", "clipboard"],
+      ["xsel", "--clipboard", "--input"],
+    ];
+    for (const [cmd, ...args] of cmds) {
+      try {
+        execSync([cmd, ...args].join(" "), { input: text, stdio: ["pipe", "ignore", "ignore"] });
+        return;
+      } catch {}
+    }
   }
-  // OSC 52 fallback (works in many modern terminals)
+  // OSC 52 fallback (works in many modern terminals regardless of platform)
   const b64 = Buffer.from(text).toString("base64");
   process.stdout.write(`\x1b]52;c;${b64}\x07`);
 }

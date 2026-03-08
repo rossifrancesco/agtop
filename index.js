@@ -5080,15 +5080,7 @@ function renderListTabBar(state, width) {
   }
   topLine += " " + bc + BOX.tr + RESET;
 
-  // Underline rule
-  const dimRule = "\x1b[38;5;238m";
-  const ruleInner = width - 2; // between ╰ and ╯ equivalent (│ on each side)
-  let ruleLine = bc + BOX.v + RESET;
-  ruleLine += dimRule + "─" + RESET;
-  ruleLine += dimRule + "─".repeat(ruleInner - 1) + RESET;
-  ruleLine += bc + BOX.v + RESET;
-
-  return topLine + "\n" + ruleLine;
+  return topLine;
 }
 
 /** Given a 1-based column, return 1 if the Live button was clicked, or -1. */
@@ -5868,7 +5860,7 @@ function handleEvent(event, state) {
         return;
       }
       // Check if click is on the list tab bar (top border or underline row)
-      if (state._listTabBarRow && (event.row === state._listTabBarRow || event.row === state._listTabBarRow + 1)) {
+      if (state._listTabBarRow && event.row === state._listTabBarRow) {
         const ltIdx = listTabAtX(event.col, state);
         if (ltIdx >= 0 && ltIdx !== state.listTab) {
           switchToListTab(state, ltIdx);
@@ -6046,7 +6038,7 @@ function handleEvent(event, state) {
       // Track hover over Live button in list tab bar
       let newListHover = -1;
       let newLiveHover = false;
-      if (state._listTabBarRow && (event.row === state._listTabBarRow || event.row === state._listTabBarRow + 1)) {
+      if (state._listTabBarRow && event.row === state._listTabBarRow) {
         const idx = listTabAtX(event.col, state);
         if (idx >= 0) { newListHover = idx; newLiveHover = true; }
       }

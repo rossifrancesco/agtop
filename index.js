@@ -279,6 +279,9 @@ async function forEachJsonl(filePath, callback) {
   try {
     for await (const raw of rl) {
       lineNum++;
+      // Yield to the event loop every 1000 lines so UI input isn't blocked
+      // by large transcript files during background refresh.
+      if (lineNum % 1000 === 0) await new Promise(r => setImmediate(r));
       const line = raw.trim();
       if (!line) continue;
       let item;
@@ -348,6 +351,15 @@ function compactUsd(value) {
   if (value === null || value === undefined) return "n/a";
   if (value === "included") return "incl";
   return `$${parseFloat(value).toFixed(2)}`;
+}
+
+/** Local-time date key "YYYY-MM-DD" for a Date object */
+function localDateKey(d) {
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+/** Local-time hour key "YYYY-MM-DDTHH" for a Date object */
+function localHourKey(d) {
+  return `${localDateKey(d)}T${String(d.getHours()).padStart(2,'0')}`;
 }
 
 function compactTokens(value) {
@@ -473,46 +485,48 @@ function abbreviatePaths(values) {
 // Codex sessions
 // ---------------------------------------------------------------------------
 
+// Cache for static Codex session metadata (id, startedAt, model, cwd).
+const _codexStaticCache = new Map(); // filePath → { sessionId, startedAt, model, cwd }
+
 function summarizeCodexSession(filePath) {
-  // Codex session files are small — use readFirstLines for metadata.
-  let sessionId = null;
-  let startedAt = null;
-  let lastActive = null;
-  let model = null;
-  let cwd = null;
+  // Static fields: read once and cache forever.
+  let staticParts = _codexStaticCache.get(filePath);
+  if (!staticParts) {
+    let sessionId = null;
+    let startedAt = null;
+    let model = null;
+    let cwd = null;
 
-  const m = UUID_RE.exec(basename(filePath, ".jsonl"));
-  if (m) sessionId = m[1];
+    const m = UUID_RE.exec(basename(filePath, ".jsonl"));
+    if (m) sessionId = m[1];
 
-  for (const item of readFirstLines(filePath, 50)) {
-    const ts = item.timestamp;
-    if (ts) lastActive = ts;
-    const type = item.type;
-    const payload = item.payload || {};
-    if (type === "session_meta") {
-      sessionId = payload.id || sessionId;
-      startedAt = payload.timestamp || item.timestamp || startedAt;
-      cwd = payload.cwd || cwd;
-    } else if (type === "turn_context") {
-      model = payload.model || model;
+    for (const item of readFirstLines(filePath, 50)) {
+      const type = item.type;
+      const payload = item.payload || {};
+      if (type === "session_meta") {
+        sessionId = payload.id || sessionId;
+        startedAt = payload.timestamp || item.timestamp || startedAt;
+        cwd = payload.cwd || cwd;
+      } else if (type === "turn_context") {
+        model = payload.model || model;
+      }
+      if (sessionId && startedAt && model && cwd) break;
     }
-    if (sessionId && startedAt && model && cwd) break;
+    staticParts = { sessionId, startedAt, model, cwd };
+    if (sessionId) _codexStaticCache.set(filePath, staticParts);
   }
 
-  // Use file mtime for lastActive in case the file is longer than 50 lines.
+  // Dynamic field: lastActive from mtime — cheap stat, no file read.
   const mt = fileMtime(filePath);
-  if (mt) {
-    const mtIso = mt.toISOString();
-    if (!lastActive || mtIso > lastActive) lastActive = mtIso;
-  }
+  const lastActive = mt ? mt.toISOString() : staticParts.startedAt;
 
   return {
     provider: "codex",
-    session_id: sessionId,
-    started_at: startedAt,
-    last_active: lastActive || startedAt,
-    model,
-    label_source: cwd,
+    session_id: staticParts.sessionId,
+    started_at: staticParts.startedAt,
+    last_active: lastActive,
+    model: staticParts.model,
+    label_source: staticParts.cwd,
     data_file: filePath,
   };
 }
@@ -589,23 +603,31 @@ function fileMtime(filePath) {
   }
 }
 
-function collectClaudeSessionSummary(transcriptPath) {
-  let earliest = null;
-  let model = null;
-  let cwd = null;
+// Cache for the static parts of a session summary (model, cwd, startedAt).
+// These are set in the first few lines and never change, so we only read once.
+const _sessionStaticCache = new Map(); // transcriptPath → { model, cwd, startedAt }
 
-  // Read only the first 30 lines for startedAt, cwd, and model.
-  for (const item of readFirstLines(transcriptPath, 30)) {
-    const parsed = parseTimestamp(item.timestamp);
-    if (parsed && (!earliest || parsed < earliest)) earliest = parsed;
-    if (!cwd && item.cwd) cwd = item.cwd;
-    if (!model && item.type === "assistant") {
-      const candidate = (item.message || {}).model;
-      if (candidate && candidate !== "<synthetic>") model = candidate;
+function collectClaudeSessionSummary(transcriptPath) {
+  // Static fields: read once and cache forever.
+  let staticParts = _sessionStaticCache.get(transcriptPath);
+  if (!staticParts) {
+    let earliest = null;
+    let model = null;
+    let cwd = null;
+    for (const item of readFirstLines(transcriptPath, 30)) {
+      const parsed = parseTimestamp(item.timestamp);
+      if (parsed && (!earliest || parsed < earliest)) earliest = parsed;
+      if (!cwd && item.cwd) cwd = item.cwd;
+      if (!model && item.type === "assistant") {
+        const candidate = (item.message || {}).model;
+        if (candidate && candidate !== "<synthetic>") model = candidate;
+      }
     }
+    staticParts = { model, cwd, startedAt: formatTimestampForSession(earliest) };
+    if (model) _sessionStaticCache.set(transcriptPath, staticParts); // only cache once we have a model
   }
 
-  // Use file mtime for lastActive (append-only files).
+  // Dynamic field: lastActive is just mtime — cheap stat, no file read.
   let latest = fileMtime(transcriptPath);
   for (const filePath of claudeTranscriptFiles(transcriptPath).slice(1)) {
     const mt = fileMtime(filePath);
@@ -613,10 +635,8 @@ function collectClaudeSessionSummary(transcriptPath) {
   }
 
   return {
-    startedAt: formatTimestampForSession(earliest),
+    ...staticParts,
     lastActive: latest ? formatTimestampForSession(latest) : null,
-    model,
-    cwd,
   };
 }
 
@@ -1131,8 +1151,8 @@ async function extractCodexSessionData(sessionFile) {
           // Track cost by day/hour — finalized after pricing is resolved
           if (item.timestamp) {
             const d = new Date(item.timestamp);
-            const dateKey = d.toISOString().slice(0, 10);
-            const hourKey = d.toISOString().slice(0, 13);
+            const dateKey = localDateKey(d);
+            const hourKey = localHourKey(d);
             const addTo = (bucket, key) => {
               if (!bucket[key]) bucket[key] = { inp: 0, cachedInp: 0, out: 0 };
               bucket[key].inp       += parseInt(lastUsage.input_tokens || 0, 10) || 0;
@@ -1249,6 +1269,7 @@ async function extractCodexSessionData(sessionFile) {
     costsByDay: costsByDayFinal,
     costsByHour: costsByHourFinal,
     metrics,
+    _localDates: true,
   };
 }
 
@@ -1453,11 +1474,11 @@ async function extractClaudeSessionData(transcriptPath) {
     costsByModel[model].output += tokenCost(out, pricing.output_per_million);
     costsByModel[model].cache_write_5m += tokenCost(cw5m, pricing.cache_write_5m_per_million);
     costsByModel[model].cache_write_1h += tokenCost(cw1h, pricing.cache_write_1h_per_million);
-    // Per-day and per-hour cost tracking (UTC), keyed by model
+    // Per-day and per-hour cost tracking (local time), keyed by model
     if (ts) {
       const d = new Date(ts);
-      const dateKey = d.toISOString().slice(0, 10);
-      const hourKey = d.toISOString().slice(0, 13);
+      const dateKey = localDateKey(d);
+      const hourKey = localHourKey(d);
       const callCost = tokenCost(inp, pricing.input_per_million) +
         tokenCost(cacheR, pricing.cache_read_per_million) +
         tokenCost(out, pricing.output_per_million) +
@@ -1503,6 +1524,7 @@ async function extractClaudeSessionData(transcriptPath) {
     costsByDay,
     costsByHour,
     metrics,
+    _localDates: true,
   };
 }
 
@@ -1716,7 +1738,8 @@ async function safeExtractSessionData(session) {
   const hasModelBreakdown = cache[dKey] && Array.isArray(cache[dKey].modelBreakdown);
   // Require costsByHour (v2 format — also implies costsByDay is per-model dict, not flat float)
   const hasCostsByDay = cache[dKey] && typeof cache[dKey].costsByHour === "object";
-  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay) {
+  const hasLocalDates = cache[dKey] && cache[dKey]._localDates === true;
+  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates) {
     SESSION_DATA_CACHE.set(memKey, cache[dKey]);
     SESSION_DATA_MTIME.set(memKey, effectiveMtime);
     return cache[dKey];
@@ -3015,13 +3038,13 @@ function computeStats(sessions) {
   const now = Date.now();
   const h1 = 3600_000, h24 = 86400_000, d7 = 604800_000;
 
-  // Spend windows (UTC boundaries)
+  // Spend windows (local-time boundaries)
   const nowMs = Date.now();
-  const todayUtc = new Date(nowMs); todayUtc.setUTCHours(0, 0, 0, 0);
-  const todayKey  = todayUtc.toISOString().slice(0, 10);
-  const weekKey   = new Date(todayUtc.getTime() - 6 * 86400_000).toISOString().slice(0, 10);
-  const monthKey  = new Date(todayUtc.getTime() - 29 * 86400_000).toISOString().slice(0, 10);
-  const hourKey   = new Date(nowMs).toISOString().slice(0, 13);
+  const today = new Date(nowMs); today.setHours(0, 0, 0, 0);
+  const todayKey  = localDateKey(today);
+  const weekKey   = localDateKey(new Date(today.getTime() - 6 * 86400_000));
+  const monthKey  = localDateKey(new Date(today.getTime() - 29 * 86400_000));
+  const hourKey   = localHourKey(new Date(nowMs));
   let spendToday = 0, spendWeek = 0, spendMonth = 0, spendHour = 0;
 
   let totalCpu = 0, totalMemory = 0, totalTools = 0;
@@ -3955,11 +3978,11 @@ function renderCostPanel(session, data, plan, panelW, rows, scrollTop, state) {
 
   if (!incl && (data.costsByDay || data.costsByHour)) {
     const nowMs = Date.now();
-    const todayUtc = new Date(nowMs); todayUtc.setUTCHours(0, 0, 0, 0);
-    const todayKey = todayUtc.toISOString().slice(0, 10);
-    const weekKey  = new Date(todayUtc.getTime() - 6 * 86400_000).toISOString().slice(0, 10);
-    const monthKey = new Date(todayUtc.getTime() - 29 * 86400_000).toISOString().slice(0, 10);
-    const hourKey  = new Date(nowMs).toISOString().slice(0, 13);
+    const today = new Date(nowMs); today.setHours(0, 0, 0, 0);
+    const todayKey = localDateKey(today);
+    const weekKey  = localDateKey(new Date(today.getTime() - 6 * 86400_000));
+    const monthKey = localDateKey(new Date(today.getTime() - 29 * 86400_000));
+    const hourKey  = localHourKey(new Date(nowMs));
 
     const mergeInto = (acc, dict) => {
       for (const [m, v] of Object.entries(dict || {})) acc[m] = (acc[m] || 0) + v;

@@ -21,6 +21,7 @@ import {
   openSync,
   readSync,
   closeSync,
+  rmSync,
 } from "node:fs";
 import { createInterface } from "node:readline";
 import { join, basename, dirname, sep } from "node:path";
@@ -219,12 +220,14 @@ OPTIONS
 KEYBOARD SHORTCUTS (interactive mode)
   j/k, arrows            Navigate sessions
   Enter                  Open detail view
-  Tab                    Cycle bottom panel tabs (Info/System/Tool/Config)
-  \`                      Toggle Summary/Live list view
-  1/2/3/4                Jump to Info/System/Tool Activity/Config panel
-  F3 or /                Search/filter sessions
+  Tab                    Cycle bottom panel tabs (Info/Cost/System/Tool/Config)
+  \`                      Toggle Sessions/Live Sessions list view
+  1/2/3/4/5              Jump to Info/Cost/System/Tool Activity/Config panel
+  F3 or /                Filter sessions by text
   F6 or >                Sort-by panel
+  F7                     Filter sessions by age (1d / 1w / 1mo)
   F5 or r                Force refresh
+  d                      Delete selected session (non-running only, with confirmation)
   q or F10               Quit
 
 MOUSE
@@ -710,33 +713,45 @@ function emptyMetrics() {
     skill_count: 0, skills: {},
     web_fetch_count: 0, web_fetches: [],
     web_search_count: 0, web_searches: [],
+    lines_added: 0, lines_removed: 0,
+    api_duration_ms: 0,
   };
 }
 
-/** Extract a human-readable detail string from a tool invocation's input. */
+/** Extract display (truncated) and full clipboard strings from a tool invocation's input.
+ *  Returns { short, full } where short is for panel display and full is for clipboard. */
 function extractToolDetail(name, input) {
-  if (!input) return "";
-  if (name === "Bash") return (input.command || "").split("\n")[0].slice(0, 200);
-  if (name === "Read") return input.file_path || "";
-  if (name === "Edit") return input.file_path || "";
-  if (name === "Write") return input.file_path || "";
-  if (name === "Grep") return (input.pattern || "") + (input.path ? ` in ${input.path}` : "");
-  if (name === "Glob") return input.pattern || "";
-  if (name === "WebFetch") return input.url || "";
-  if (name === "WebSearch") return input.query || "";
-  if (name === "Agent") return (input.prompt || "").split("\n")[0].slice(0, 120);
-  if (name === "ToolSearch") return input.query || "";
-  if (name === "TaskCreate") return (input.description || "").split("\n")[0].slice(0, 120);
-  if (name === "TaskUpdate") return input.task_id ? `#${input.task_id} ${input.status || ""}`.trim() : "";
-  if (name === "TaskGet" || name === "TaskStop" || name === "TaskOutput") return input.task_id ? `#${input.task_id}` : "";
-  if (name === "TaskList") return "(list)";
-  // MCP and other tools: first string value
-  if (typeof input === "object") {
+  if (!input) return { short: "", full: "" };
+  if (name === "Bash") {
+    const cmd = input.command || "";
+    return { short: cmd.split("\n")[0].slice(0, 200), full: cmd };
+  }
+  if (name === "Agent") {
+    const p = input.prompt || "";
+    return { short: p.split("\n")[0].slice(0, 120), full: p };
+  }
+  if (name === "TaskCreate") {
+    const d = input.description || "";
+    return { short: d.split("\n")[0].slice(0, 120), full: d };
+  }
+  let s = "";
+  if (name === "Read") s = input.file_path || "";
+  else if (name === "Edit") s = input.file_path || "";
+  else if (name === "Write") s = input.file_path || "";
+  else if (name === "Grep") s = (input.pattern || "") + (input.path ? ` in ${input.path}` : "");
+  else if (name === "Glob") s = input.pattern || "";
+  else if (name === "WebFetch") s = input.url || "";
+  else if (name === "WebSearch") s = input.query || "";
+  else if (name === "ToolSearch") s = input.query || "";
+  else if (name === "TaskUpdate") s = input.task_id ? `#${input.task_id} ${input.status || ""}`.trim() : "";
+  else if (name === "TaskGet" || name === "TaskStop" || name === "TaskOutput") s = input.task_id ? `#${input.task_id}` : "";
+  else if (name === "TaskList") s = "(list)";
+  else if (typeof input === "object") {
     for (const v of Object.values(input)) {
-      if (typeof v === "string" && v.length > 0) return v.slice(0, 120);
+      if (typeof v === "string" && v.length > 0) { s = v.slice(0, 120); break; }
     }
   }
-  return "";
+  return { short: s, full: s };
 }
 
 const MAX_TOOL_DETAILS = 200; // max invocation details per tool
@@ -1139,7 +1154,9 @@ async function extractCodexSessionData(sessionFile) {
         const parsed = typeof args === "string" ? JSON.parse(args) : (args || {});
         const detail = extractToolDetail(name, parsed);
         if (!metrics.tool_details[name]) metrics.tool_details[name] = [];
-        metrics.tool_details[name].push({ d: detail || "(no args)", ts: item.timestamp || "" });
+        const entry = { d: detail.short || "(no args)", ts: item.timestamp || "" };
+        if (detail.full && detail.full !== detail.short) entry.full = detail.full;
+        metrics.tool_details[name].push(entry);
         if (metrics.tool_details[name].length > MAX_TOOL_DETAILS) {
           metrics.tool_details[name] = metrics.tool_details[name].slice(-MAX_TOOL_DETAILS);
         }
@@ -1221,21 +1238,12 @@ function requestKey(item, message) {
 }
 
 async function extractClaudeSessionData(transcriptPath) {
-  const tokenTotals = {
-    input: 0,
-    cache_write_5m: 0,
-    cache_write_1h: 0,
-    cache_read: 0,
-    output: 0,
-  };
-  const costTotals = {
-    input: 0,
-    cache_write_5m: 0,
-    cache_write_1h: 0,
-    cache_read: 0,
-    output: 0,
-  };
+  const tokenTotals = { input: 0, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0, output: 0 };
+  const costTotals  = { input: 0, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0, output: 0 };
+  const tokensByModel = {}; // model → { input, cache_write_5m, cache_write_1h, cache_read, output }
+  const costsByModel  = {}; // model → { input, cache_write_5m, cache_write_1h, cache_read, output }
   const models = {};
+  let lastModel = null;
   const metrics = emptyMetrics();
   const seenToolIds = new Set();
   const seenUrls = new Set();
@@ -1243,10 +1251,30 @@ async function extractClaudeSessionData(transcriptPath) {
   const CMD_RE = /<command-name>\/?([^<]+)<\/command-name>/g;
 
   for (const filePath of claudeTranscriptFiles(transcriptPath)) {
-    const seen = new Set();
+    // Map of requestId → latest token snapshot (streaming writes same requestId multiple times;
+    // the last entry has final token counts — keep that one, discard earlier partials).
+    const lastByKey = new Map();
+    // Keyless entries (no requestId/messageId) accumulate immediately.
     await forEachJsonl(filePath, (item) => {
-      // --- User branch: scan for skill/slash commands ---
+      // --- System branch: accumulate API duration ---
+      if (item.type === "system" && item.subtype === "turn_duration" && item.durationMs) {
+        metrics.api_duration_ms += item.durationMs;
+        return;
+      }
+
+      // --- User branch: scan for skill/slash commands and structuredPatch line counts ---
       if (item.type === "user") {
+        // Lines added/removed from structuredPatch in tool results
+        const tr = item.toolUseResult;
+        if (tr && typeof tr === "object" && Array.isArray(tr.structuredPatch)) {
+          for (const hunk of tr.structuredPatch) {
+            for (const line of (hunk.lines || [])) {
+              if (line.startsWith("+")) metrics.lines_added++;
+              else if (line.startsWith("-")) metrics.lines_removed++;
+            }
+          }
+        }
+
         const content = (item.message || {}).content;
         const texts = [];
         if (typeof content === "string") texts.push(content);
@@ -1291,7 +1319,9 @@ async function extractClaudeSessionData(transcriptPath) {
           const input = block.input || {};
           const detail = extractToolDetail(name, input);
           if (!metrics.tool_details[name]) metrics.tool_details[name] = [];
-          metrics.tool_details[name].push({ d: detail || "(no args)", ts: item.timestamp || "" });
+          const detailEntry = { d: detail.short || "(no args)", ts: item.timestamp || "" };
+          if (detail.full && detail.full !== detail.short) detailEntry.full = detail.full;
+          metrics.tool_details[name].push(detailEntry);
           if (metrics.tool_details[name].length > MAX_TOOL_DETAILS) {
             metrics.tool_details[name] = metrics.tool_details[name].slice(-MAX_TOOL_DETAILS);
           }
@@ -1313,12 +1343,9 @@ async function extractClaudeSessionData(transcriptPath) {
         }
       }
 
-      // --- Token / cost accounting (existing logic) ---
+      // --- Token / cost accounting ---
       const usage = message.usage;
       if (!usage) return;
-
-      const key = requestKey(item, message);
-      if (key !== null && seen.has(key)) return;
 
       const inputTokens = parseInt(usage.input_tokens || 0, 10) || 0;
       const cacheReadTokens =
@@ -1344,41 +1371,54 @@ async function extractClaudeSessionData(transcriptPath) {
       )
         return;
 
-      if (key !== null) seen.add(key);
-
       const model = message.model;
       if (!model || model === "<synthetic>")
         throw new SessionCostError(
           `Encountered billable Claude usage with unknown model in ${filePath}`
         );
 
-      const pricing = resolveClaudePricing(model);
-      models[model] = (models[model] || 0) + 1;
-
-      tokenTotals.input += inputTokens;
-      tokenTotals.cache_write_5m += cacheWrite5mTokens;
-      tokenTotals.cache_write_1h += cacheWrite1hTokens;
-      tokenTotals.cache_read += cacheReadTokens;
-      tokenTotals.output += outputTokens;
-
-      costTotals.input += tokenCost(inputTokens, pricing.input_per_million);
-      costTotals.cache_write_5m += tokenCost(
-        cacheWrite5mTokens,
-        pricing.cache_write_5m_per_million
-      );
-      costTotals.cache_write_1h += tokenCost(
-        cacheWrite1hTokens,
-        pricing.cache_write_1h_per_million
-      );
-      costTotals.cache_read += tokenCost(
-        cacheReadTokens,
-        pricing.cache_read_per_million
-      );
-      costTotals.output += tokenCost(
-        outputTokens,
-        pricing.output_per_million
-      );
+      const key = requestKey(item, message);
+      const snapshot = { inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, model };
+      if (key !== null) {
+        // Overwrite with latest — streaming partials share the same requestId;
+        // the final entry has the highest (correct) token counts.
+        lastByKey.set(key, snapshot);
+      } else {
+        accum(model, inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens);
+      }
     });
+    // Flush the last-occurrence map for this file
+    for (const { inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, model } of lastByKey.values()) {
+      accum(model, inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens);
+    }
+  }
+
+  function accum(model, inp, cacheR, out, cw5m, cw1h) {
+    lastModel = model;
+    models[model] = (models[model] || 0) + 1;
+    const pricing = resolveClaudePricing(model);
+    tokenTotals.input += inp;
+    tokenTotals.cache_read += cacheR;
+    tokenTotals.output += out;
+    tokenTotals.cache_write_5m += cw5m;
+    tokenTotals.cache_write_1h += cw1h;
+    costTotals.input += tokenCost(inp, pricing.input_per_million);
+    costTotals.cache_read += tokenCost(cacheR, pricing.cache_read_per_million);
+    costTotals.output += tokenCost(out, pricing.output_per_million);
+    costTotals.cache_write_5m += tokenCost(cw5m, pricing.cache_write_5m_per_million);
+    costTotals.cache_write_1h += tokenCost(cw1h, pricing.cache_write_1h_per_million);
+    if (!tokensByModel[model]) tokensByModel[model] = { input: 0, cache_read: 0, output: 0, cache_write_5m: 0, cache_write_1h: 0 };
+    if (!costsByModel[model])  costsByModel[model]  = { input: 0, cache_read: 0, output: 0, cache_write_5m: 0, cache_write_1h: 0 };
+    tokensByModel[model].input += inp;
+    tokensByModel[model].cache_read += cacheR;
+    tokensByModel[model].output += out;
+    tokensByModel[model].cache_write_5m += cw5m;
+    tokensByModel[model].cache_write_1h += cw1h;
+    costsByModel[model].input += tokenCost(inp, pricing.input_per_million);
+    costsByModel[model].cache_read += tokenCost(cacheR, pricing.cache_read_per_million);
+    costsByModel[model].output += tokenCost(out, pricing.output_per_million);
+    costsByModel[model].cache_write_5m += tokenCost(cw5m, pricing.cache_write_5m_per_million);
+    costsByModel[model].cache_write_1h += tokenCost(cw1h, pricing.cache_write_1h_per_million);
   }
 
   if (!Object.keys(models).length)
@@ -1389,9 +1429,19 @@ async function extractClaudeSessionData(transcriptPath) {
   const totalCost = Object.values(costTotals).reduce((a, b) => a + b, 0);
   const totalTokens = Object.values(tokenTotals).reduce((a, b) => a + b, 0);
 
+  // Build per-model summary for display
+  const modelBreakdown = Object.keys(tokensByModel).sort().map(model => {
+    const t = tokensByModel[model];
+    const c = costsByModel[model];
+    const modelTotal = Object.values(c).reduce((a, b) => a + b, 0);
+    return { model, tokens: t, costs: c, total: money(modelTotal) };
+  });
+
   return {
     provider: "claude",
+    lastModel,
     models: Object.keys(models).sort(),
+    modelBreakdown,
     tokens: { ...tokenTotals, total: totalTokens },
     costs: {
       input: money(costTotals.input),
@@ -1422,9 +1472,22 @@ function loadDiskCache() {
   return _diskCache;
 }
 
+function pruneDiskCache() {
+  if (!_diskCache) return;
+  for (const key of Object.keys(_diskCache)) {
+    const filePath = key.split("|")[0];
+    // Remove if file no longer exists or has been superseded by a newer entry
+    if (diskCacheKey(filePath) !== key) {
+      delete _diskCache[key];
+      _diskCacheDirty = true;
+    }
+  }
+}
+
 function saveDiskCache() {
   if (!_diskCacheDirty) return;
   try {
+    pruneDiskCache();
     mkdirSync(COST_CACHE_DIR, { recursive: true });
     writeFileSync(COST_CACHE_FILE, JSON.stringify(_diskCache));
   } catch {
@@ -1443,7 +1506,8 @@ function loadUiPrefs() {
 function saveUiPrefs(prefs) {
   try {
     mkdirSync(COST_CACHE_DIR, { recursive: true });
-    writeFileSync(UI_PREFS_FILE, JSON.stringify(prefs));
+    const existing = loadUiPrefs();
+    writeFileSync(UI_PREFS_FILE, JSON.stringify({ ...existing, ...prefs }));
   } catch { /* best effort */ }
 }
 
@@ -1597,7 +1661,9 @@ async function safeExtractSessionData(session) {
     && Object.values(cachedDetails).every(arr =>
       !arr.length || (typeof arr[0] === "object" && arr[0].d !== undefined))
     && Object.keys(cachedTools).every(t => cachedDetails[t] && cachedDetails[t].length > 0);
-  if (dKey && cache[dKey] && detailsValid) {
+  const hasLinesFields = cachedMetrics && typeof cachedMetrics.lines_added !== "undefined";
+  const hasModelBreakdown = cache[dKey] && Array.isArray(cache[dKey].modelBreakdown);
+  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown) {
     SESSION_DATA_CACHE.set(memKey, cache[dKey]);
     SESSION_DATA_MTIME.set(memKey, effectiveMtime);
     return cache[dKey];
@@ -1638,6 +1704,9 @@ async function annotateListCosts(sessions, plan) {
         session.list_output_tokens = t.output || 0;
         const m = safeMetrics(data);
         session.list_tool_count = m.tool_count;
+        // Update model to the most recently used one
+        if (data.lastModel) session.model = data.lastModel;
+        else if (data.models && data.models.length) session.model = data.models[data.models.length - 1];
       }
       if (planIncludesProvider(plan, session.provider || "")) {
         session.list_total_cost = "included";
@@ -1751,7 +1820,34 @@ function extractContextUsage(session) {
     if (session.provider === "claude") {
       // Claude: last assistant message usage block
       // used = input_tokens + cache_creation_input_tokens + cache_read_input_tokens
-      const maxCtx = 200000; // Claude models default
+      // Context window: check Claude Code settings for [1m] model variant,
+      // then LiteLLM, then infer from usage (>200k → 1M tier)
+      const CLAUDE_DEFAULT_CTX = 200000;
+      const CLAUDE_1M_CTX = 1_048_576;
+
+      // Check Claude Code settings files for model with [1m] suffix
+      // Priority: local project > project > global
+      let settingsCtx = 0;
+      const cwd = session.label_source;
+      const settingsFiles = [
+        ...(cwd ? [join(cwd, ".claude", "settings.local.json"), join(cwd, ".claude", "settings.json")] : []),
+        join(HOME, ".claude", "settings.json"),
+      ];
+      for (const sf of settingsFiles) {
+        try {
+          const s = JSON.parse(readFileSync(sf, "utf-8"));
+          if (s.model && typeof s.model === "string") {
+            settingsCtx = s.model.includes("[1m]") ? CLAUDE_1M_CTX : CLAUDE_DEFAULT_CTX;
+            break; // most specific setting wins
+          }
+        } catch { /* file missing or invalid */ }
+      }
+
+      let litellmCtx = 0;
+      if (_litellmPricing && session.model) {
+        const entry = findLitellmEntry(session.model, _litellmPricing);
+        if (entry && entry.max_input_tokens) litellmCtx = entry.max_input_tokens;
+      }
       let sawCompactBoundary = false;
       for (let i = lines.length - 1; i >= 0; i--) {
         const line = lines[i].trim();
@@ -1767,6 +1863,10 @@ function extractContextUsage(session) {
               (u.cache_creation_input_tokens || 0) +
               (u.cache_read_input_tokens || 0);
             if (used > 0) {
+              // Resolution order: settings [1m] > usage inference > LiteLLM > default
+              const maxCtx = settingsCtx > 0 ? settingsCtx
+                : used > CLAUDE_DEFAULT_CTX ? CLAUDE_1M_CTX
+                : litellmCtx > 0 ? litellmCtx : CLAUDE_DEFAULT_CTX;
               return { used, max: maxCtx, percent: Math.round((used / maxCtx) * 100),
                 compacting: sawCompactBoundary };
             }
@@ -1774,6 +1874,7 @@ function extractContextUsage(session) {
         } catch { continue; }
       }
       // If we saw compact_boundary but no assistant usage, still report compacting
+      const maxCtx = settingsCtx > 0 ? settingsCtx : litellmCtx > 0 ? litellmCtx : CLAUDE_DEFAULT_CTX;
       if (sawCompactBoundary) {
         return { used: 0, max: maxCtx, percent: 0, compacting: true };
       }
@@ -1894,11 +1995,11 @@ const DIM = "\x1b[2m";
 // btop-style color palette — dark bg, vibrant accents, rounded box borders
 const C = {
   // Panel borders and titles
-  border: "\x1b[38;5;60m",     // muted blue-gray for box borders
-  borderHi: "\x1b[38;5;75m",   // brighter blue for active panel border
-  panelTitle: "\x1b[1;38;5;75m", // bold bright blue for panel titles
+  border: "\x1b[38;5;60m",      // muted blue-gray for box borders
+  borderHi: "\x1b[38;5;75m",    // brighter blue for active panel border / tab underlines
+  panelTitle: "\x1b[1;38;5;179m", // bold muted gold for panel titles and active tab text
   // Labels and values
-  hdrLabel: "\x1b[1;38;5;75m", // bold blue for labels
+  hdrLabel: "\x1b[1;38;5;75m", // bold blue for field labels (distinct from amber titles)
   hdrValue: "\x1b[1;37m",      // bold white for values
   hdrCyan: "\x1b[1;36m",       // bold cyan for Claude counts
   hdrGreen: "\x1b[1;32m",      // bold green for Codex counts
@@ -1997,7 +2098,7 @@ function pushHistory(map, key, value) {
 
 // btop-style smooth gradient: green(114) → teal(79) → yellow(221) → red(203)
 function sparkColor(ratio) {
-  if (ratio <= 0.01) return "\x1b[38;5;238m"; // near-zero: dark gray
+  if (ratio <= 0.01) return "\x1b[38;5;22m";  // near-zero: dark forest green
   if (ratio <= 0.30) return "\x1b[38;5;71m";  // low: muted green
   if (ratio <= 0.50) return "\x1b[38;5;114m"; // medium-low: green
   if (ratio <= 0.70) return "\x1b[38;5;186m"; // medium: yellow-green
@@ -2016,12 +2117,64 @@ function sparkColorAccent(ratio) {
 
 // Green-to-red gradient for spend/token metrics
 function sparkColorSpend(ratio) {
-  if (ratio <= 0.01) return "\x1b[38;5;238m"; // near-zero: dark gray
+  if (ratio <= 0.01) return "\x1b[38;5;22m";  // near-zero: dark forest green
   if (ratio <= 0.25) return "\x1b[38;5;71m";  // low: muted green
   if (ratio <= 0.50) return "\x1b[38;5;114m"; // medium: green
   if (ratio <= 0.75) return "\x1b[38;5;186m"; // medium-high: yellow-green
   if (ratio <= 0.85) return "\x1b[38;5;221m"; // high: yellow
   return "\x1b[38;5;203m";                     // very high: red
+}
+
+/**
+ * Render a single-row braille sparkline (column chart style).
+ * Each character encodes a 1×4 column; bottom dot = bit 0x40, top = bit 0x01.
+ * Braille bits for left column: row0=0x01, row1=0x02, row2=0x04, row3=0x40
+ * We use only the left column of each braille cell for 1:1 char-to-value mapping.
+ */
+function renderBrailleSparkline(values, width, maxVal, colorMode) {
+  const colorFn = colorMode === "cpu" ? sparkColor
+    : colorMode === "spend" ? sparkColorSpend
+    : sparkColorAccent;
+  // Left-column braille bits, bottom-to-top: bit3(0x40), bit2(0x04), bit1(0x02), bit0(0x01)
+  const bits = [0x40, 0x04, 0x02, 0x01]; // row 3, 2, 1, 0
+  const baseline = String.fromCharCode(0x2800 | 0x40); // bottom dot only
+  const dimBase = (colorMode === "spend" || colorMode === "cpu") ? "\x1b[38;5;22m" : "\x1b[38;5;236m";
+
+  if (!values.length) {
+    return (dimBase + baseline + RESET).repeat(width);
+  }
+  const start = Math.max(0, values.length - width);
+  const visible = values.slice(start);
+
+  let hi;
+  if (maxVal > 0) {
+    hi = maxVal;
+  } else {
+    hi = Math.max(...visible);
+    if (hi <= 0) hi = 1;
+    else hi *= 1.1;
+  }
+
+  let out = "";
+  // Leading empty area
+  if (visible.length < width) {
+    const fill = width - visible.length;
+    out += (dimBase + baseline + RESET).repeat(fill);
+  }
+
+  for (const v of visible) {
+    if (v <= 0) {
+      out += dimBase + baseline + RESET;
+      continue;
+    }
+    const ratio = Math.max(0, Math.min(1, v / hi));
+    // Map to 0-4 filled dots (bottom-up)
+    const filled = Math.max(1, Math.round(ratio * 4));
+    let code = 0x2800;
+    for (let d = 0; d < filled; d++) code |= bits[d];
+    out += colorFn(ratio) + String.fromCharCode(code) + RESET;
+  }
+  return out;
 }
 
 /**
@@ -2179,7 +2332,7 @@ function renderBrailleChart(values, totalWidth, chartRows, maxVal, colorMode, fo
 // Column definitions
 // ---------------------------------------------------------------------------
 
-const LIST_TABS = ["Summary", "Live"];
+const LIST_TABS = ["Sessions", "Live Sessions"];
 
 // Shared column defs
 const COL_STATUS = {
@@ -2264,7 +2417,7 @@ const COL_OUT_TOKENS = {
   compare: (a, b) => (a.list_output_tokens || 0) - (b.list_output_tokens || 0),
 };
 const COL_LAST_TOOL = {
-  key: "last_tool", label: "LAST TOOL", width: 14, align: "left", desc: "Most recently invoked tool",
+  key: "last_tool", label: "LAST_TOOL", width: 14, align: "left", desc: "Most recently invoked tool",
   render: (s) => {
     const t = s.list_last_tool || "";
     return t.replace(/^mcp__[^_]+__/, "mcp:");
@@ -2670,7 +2823,6 @@ async function collectProcessMetrics(sessions) {
           if (!rootPids.has(key)) rootPids.set(key, pid);
         } else {
           // Truly orphan: running process with no session file yet
-          // Use a synthetic key based on pid so it gets tracked
           const syntheticKey = `${provider}:_pid_${pid}`;
           rootPids.set(syntheticKey, pid);
           _orphanProcessInfo.set(syntheticKey, { pid, provider, cwd: cached.cwd });
@@ -2734,7 +2886,9 @@ function createState() {
     hScroll: 0,
     selectedRow: 0,
     searchQuery: "",
-    mode: "list", // "list" | "detail" | "search" | "help" | "sortby"
+    inactivityFilter: null, // null | "1d" | "1w" | "1mo"
+    _inactivityCursor: 3, // index into INACTIVITY_OPTIONS (default: "No filter")
+    mode: "list", // "list" | "detail" | "search" | "help" | "sortby" | "delete" | "inactivity"
     sortbyIdx: 0, // cursor position in sort-by sidebar
     detailSession: null,
     detailData: null,
@@ -2749,11 +2903,17 @@ function createState() {
     headerLines: 4, // number of header lines (boxTop + 2 content + boxBottom)
     _processMetrics: new Map(),
     _tier2Tick: TIER2_INTERVAL_TICKS - 1,
-    bottomTab: 0, // 0=Info, 1=System, 2=Agent
+    bottomTab: 0, // 0=Info, 1=Cost, 2=System, 3=Tool Activity, 4=Config
     hoverTab: -1, // tab index being hovered, -1 = none
-    listTab: 0, // 0=Summary, 1=Live
+    listTab: 0, // 0=Sessions, 1=Live Sessions
     hoverListTab: -1, // list tab hover, -1 = none
     configSubTab: 0, // active sub-tab in Config panel
+    costScroll: 0, // scroll offset in Cost panel content
+    _costScrollbar: null, // scrollbar geometry for Cost panel
+    _costScrollbarHover: false,
+    _costScrollbarDrag: false,
+    _costDragStartRow: 0,
+    _costDragStartScroll: 0,
     configScroll: 0, // scroll offset in Config panel content
     configSubTabHover: -1, // hover over config sub-tab
     _configPanelTop: 0, // 1-based row of first content row in config panel
@@ -2776,6 +2936,9 @@ function createState() {
     _agentCopyFlashTs: 0, // timestamp of copy flash
     _agentToolCounts: {}, // previous tool counts for flash detection
     _agentToolFlash: {}, // {toolName: timestamp} for count-change flash
+    _agentPrevMaxScroll: undefined, // previous maxContentScroll for auto-scroll tracking
+    _colFlash: {}, // {sessionKey: {tools: ts, tools_rate: ts}} flash timestamps
+    _colPrev: {},  // {sessionKey: {tools: count, tools_rate: count}} previous values
     _hoverAgentArrow: "", // "up" or "down" or ""
     _hoverColKey: null, // column key being hovered on header row
     _quota: { ts: 0, fetched: false, claude: null, codex: null }, // provider quota data
@@ -2872,6 +3035,16 @@ function applySortAndFilter(state) {
   // Live tab: only show sessions with a running process
   if (state.listTab === 1) {
     list = list.filter((s) => !!s.process);
+  }
+
+  // Inactivity filter
+  if (state.inactivityFilter) {
+    const now = Date.now();
+    const ms = { "1d": 86400000, "1w": 604800000, "1mo": 2592000000 }[state.inactivityFilter] || 0;
+    if (ms) list = list.filter(s => {
+      const t = s.last_active || s.started_at || "";
+      return t && (now - new Date(t).getTime()) <= ms;
+    });
   }
 
   // Filter by search query
@@ -3022,21 +3195,21 @@ function renderHeader(stats, width, state) {
   // Two columns: each has label + chart, separated by a gap
   const gap = 2;
   const colW = Math.floor((inner - gap) / 2);
-  const labelW = 18;
+  const labelW = 22;
   const chartW = Math.max(4, colW - labelW - 1);
 
   // Row 1: Spend + CPU
   const spendLabel = `${C.hdrLabel}Total Spend${RESET} ${C.hdrYellow}$${curSpend.toFixed(2)}${RESET}`;
-  const spendChart = renderSparkline(_globalSpendDeltaHist, chartW, 0, "spend", "dots");
+  const spendChart = renderBrailleSparkline(_globalSpendDeltaHist, chartW, 0, "spend");
   const cpuLabel = `${C.hdrLabel}Agents CPU${RESET} ${C.hdrValue}${stats.totalCpu}%${RESET}`;
-  const cpuChart = renderSparkline(_globalCpuHist, chartW, 100, "cpu", "dots");
+  const cpuChart = renderBrailleSparkline(_globalCpuHist, chartW, 100, "cpu");
   const row1Left = buildOverviewCell(spendLabel, spendChart, labelW, chartW, colW);
   const row1Right = buildOverviewCell(cpuLabel, cpuChart, labelW, chartW, colW);
   lines.push(boxLine(row1Left + " ".repeat(gap) + row1Right, width));
 
   // Row 2: Tokens + Memory
   const tokLabel = `${C.hdrLabel}Total Tokens${RESET} ${C.hdrValue}${compactTokens(curTokens)}${RESET}`;
-  const tokChart = renderSparkline(_globalTokenDeltaHist, chartW, 0, "spend", "dots");
+  const tokChart = renderBrailleSparkline(_globalTokenDeltaHist, chartW, 0, "spend");
   const memLabel = `${C.hdrLabel}Agents Mem${RESET} ${C.hdrValue}${memMB.toFixed(0)} MB${RESET}`;
   const row2Left = buildOverviewCell(tokLabel, tokChart, labelW, chartW, colW);
   const row2Right = buildOverviewCell(memLabel, "", labelW, 0, colW);
@@ -3222,6 +3395,21 @@ function renderSessionRow(session, index, isSelected, width, now, hScroll, state
     } else if (col.key === "cost_rate") {
       const r = session.list_cost_per_min || 0;
       colColor = r > 0.50 ? C.costRed : r > 0.10 ? C.costYellow : r > 0.001 ? C.chartBarLow : C.dimText;
+    } else if (col.key === "tools" || col.key === "tools_rate" || col.key === "in_tokens" || col.key === "out_tokens") {
+      const skey = session.provider + ":" + session.session_id;
+      const cur = col.key === "tools" ? (session.list_tool_count || 0)
+        : col.key === "tools_rate" ? (session.list_tools_since_start || 0)
+        : col.key === "in_tokens" ? (session.list_input_tokens || 0)
+        : (session.list_output_tokens || 0);
+      if (!state._colPrev[skey]) state._colPrev[skey] = {};
+      const prev = state._colPrev[skey][col.key];
+      if (prev !== undefined && prev !== cur) {
+        if (!state._colFlash[skey]) state._colFlash[skey] = {};
+        state._colFlash[skey][col.key] = now;
+      }
+      state._colPrev[skey][col.key] = cur;
+      const flashTs = (state._colFlash[skey] && state._colFlash[skey][col.key]) || 0;
+      if (flashTs && (now - flashTs < 1500)) colColor = "\x1b[1;38;5;105m";
     }
     if (colColor) {
       line += bg + colColor + text + RESET + base;
@@ -3242,8 +3430,8 @@ function renderSessionRow(session, index, isSelected, width, now, hScroll, state
 
 function renderFooter(state, width) {
   const items = [
-    ["F1", "Help", "f1"], ["F3", "Search", "f3"], ["F5", "Refresh", "f5"],
-    ["F6", "SortBy", "f6"], ["Tab", "Panel", "tab"], ["`", "View", "backtick"], ["F10", "Quit", "f10"],
+    ["F1", "Help", "f1"], ["F3", "Filter", "f3"], ["F5", "Refresh", "f5"],
+    ["F6", "SortBy", "f6"], ["F7", "Age", "f7"], ["Tab", "Panel", "tab"], ["`", "View", "backtick"], ["d", "Delete", "d_delete"], ["F10", "Quit", "f10"],
   ];
   let line = "";
   state._footerItems = [];
@@ -3253,15 +3441,36 @@ function renderFooter(state, width) {
     const endCol = line.replace(/\x1b\[[^m]*m/g, "").length; // 1-based inclusive
     state._footerItems.push({ start: startCol, end: endCol, action });
   }
-  if (state.searchQuery && state.mode !== "search") {
-    line += C.searchFg + " Filter: " + state.searchQuery + " " + RESET;
-    const beforeX = line.replace(/\x1b\[[^m]*m/g, "").length;
-    const xStyle = state._hoverFilterX ? "\x1b[1;4;38;5;203m" : "\x1b[38;5;167m";
-    line += xStyle + "✕" + RESET + " ";
-    state._filterXCol = beforeX + 1; // 1-based column of the ✕
-  } else {
-    state._filterXCol = -1;
+  const toolbarLen = line.replace(/\x1b\[[^m]*m/g, "").length;
+  let remaining = width - toolbarLen;
+
+  state._ageFilterXCol = -1;
+  if (state.inactivityFilter) {
+    const label = { "1d": "1 day", "1w": "1 week", "1mo": "1 month" }[state.inactivityFilter] || state.inactivityFilter;
+    const chunk = " Age: <" + label + " ✕ ";
+    if (remaining >= chunk.length) {
+      line += "\x1b[1;38;5;179m" + " Age: <" + label + " " + RESET;
+      const beforeAgeX = line.replace(/\x1b\[[^m]*m/g, "").length;
+      const ageXStyle = state._hoverAgeX ? "\x1b[1;4;38;5;203m" : "\x1b[38;5;167m";
+      line += ageXStyle + "✕" + RESET + " ";
+      state._ageFilterXCol = beforeAgeX + 1;
+      remaining -= chunk.length;
+    }
   }
+
+  state._filterXCol = -1;
+  if (state.searchQuery && state.mode !== "search") {
+    const chunk = " Filter: " + state.searchQuery + " ✕ ";
+    if (remaining >= chunk.length) {
+      line += C.searchFg + " Filter: " + state.searchQuery + " " + RESET;
+      const beforeX = line.replace(/\x1b\[[^m]*m/g, "").length;
+      const xStyle = state._hoverFilterX ? "\x1b[1;4;38;5;203m" : "\x1b[38;5;167m";
+      line += xStyle + "✕" + RESET + " ";
+      state._filterXCol = beforeX + 1;
+      remaining -= chunk.length;
+    }
+  }
+
   const plain = line.replace(/\x1b\[[^m]*m/g, "");
   const pad = Math.max(0, width - plain.length);
   return line + C.footerBg + " ".repeat(pad) + RESET;
@@ -3412,7 +3621,7 @@ const MAX_PANEL = 30;
  * Build content lines for each of the three bottom panels, then merge
  * them side-by-side with box borders into composite screen lines.
  */
-const BOTTOM_TABS = ["Info", "System", "Tool Activity", "Config"];
+const BOTTOM_TABS = ["Info", "System", "Tool Activity", "Cost", "Config"];
 
 function renderBottomPanels(session, data, plan, width, panelHeight, activeTab, hoverTab, state) {
   const bc = C.border;
@@ -3437,9 +3646,9 @@ function renderBottomPanels(session, data, plan, width, panelHeight, activeTab, 
     if (i > 0) topLine += "  ";
     const name = BOTTOM_TABS[i];
     if (i === activeTab) {
-      topLine += "\x1b[1;38;5;255m" + name + RESET;
+      topLine += C.panelTitle + name + RESET;
     } else if (i === hoverTab) {
-      topLine += "\x1b[4;38;5;255m" + name + RESET; // underline + bright white on hover
+      topLine += "\x1b[4;38;5;179m" + name + RESET; // underline amber on hover
     } else {
       topLine += "\x1b[38;5;245m" + name + RESET;
     }
@@ -3472,7 +3681,8 @@ function renderBottomPanels(session, data, plan, width, panelHeight, activeTab, 
     case 0: contentLines = renderSessionInfoPanel(session, data, plan, width, innerH); break;
     case 1: contentLines = renderSystemPanel(session, data, width, innerH); break;
     case 2: contentLines = renderAgentPanel(session, data, width, innerH, state); break;
-    case 3: contentLines = renderConfigPanel(session, width, innerH, state); break;
+    case 3: contentLines = renderCostPanel(session, data, plan, width, innerH, state.costScroll, state); break;
+    case 4: contentLines = renderConfigPanel(session, width, innerH, state); break;
     default: contentLines = renderSessionInfoPanel(session, data, plan, width, innerH);
   }
 
@@ -3527,7 +3737,7 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows) {
   }
 
   // ── Identity ──
-  const displayModel = session.model || (data.models || [data.model])[0] || "?";
+  const displayModel = data.lastModel || session.model || (data.models || [data.model])[0] || "?";
   const provColor = session.provider === "claude" ? "\x1b[38;5;173m" : "\x1b[38;5;110m";
   const ml = displayModel.toLowerCase();
   const mdlColor = ml.startsWith("claude") ? "\x1b[38;5;173m"
@@ -3546,35 +3756,44 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows) {
   const shortProj = proj.length > w - 12 ? "…" + proj.slice(-(w - 13)) : proj;
   addCopyLine("Dir", shortProj, proj, "dir", 9);
 
-  // Started
+  // Started + duration
+  const m = safeMetrics(data);
   if (session.started_at) {
     const d = parseTimestamp(session.started_at);
     const started = d ? d.toLocaleString() : session.started_at;
     lines.push(`${C.hdrLabel}Started${RESET}    ${C.hdrValue}${started}${RESET}`);
+    if (session.provider === "claude") {
+      if (m.api_duration_ms > 0) {
+        const apiSec = Math.round(m.api_duration_ms / 1000);
+        const apiH = Math.floor(apiSec / 3600);
+        const apiM = Math.floor((apiSec % 3600) / 60);
+        const apiS = apiSec % 60;
+        const apiStr = apiH > 0 ? `${apiH}h ${apiM}m ${apiS}s` : apiM > 0 ? `${apiM}m ${apiS}s` : `${apiS}s`;
+        lines.push(`${C.hdrLabel}API time${RESET}   ${C.hdrValue}${apiStr}${RESET}`);
+      }
+      if (session.last_active) {
+        const start = parseTimestamp(session.started_at);
+        const end = parseTimestamp(session.last_active);
+        if (start && end) {
+          const wallSec = Math.max(0, Math.round((end - start) / 1000));
+          const wH = Math.floor(wallSec / 3600);
+          const wM = Math.floor((wallSec % 3600) / 60);
+          const wS = wallSec % 60;
+          const wallStr = wH > 0 ? `${wH}h ${wM}m ${wS}s` : wM > 0 ? `${wM}m ${wS}s` : `${wS}s`;
+          lines.push(`${C.hdrLabel}Wall time${RESET}  ${C.hdrValue}${wallStr}${RESET}`);
+        }
+      }
+    }
   }
 
-  // ── Separator ──
-  if (lines.length < rows - 4) {
+  // ── Lines added/removed (Claude only) ──
+  if (session.provider === "claude" && (m.lines_added > 0 || m.lines_removed > 0) && lines.length < rows - 3) {
     lines.push(dimRule + "─".repeat(Math.min(w, 40)) + RESET);
+    const addStr = m.lines_added > 0 ? `${C.hdrLabel}+${RESET}\x1b[38;5;114m${m.lines_added.toLocaleString()}${RESET}` : "";
+    const remStr = m.lines_removed > 0 ? `${C.hdrLabel}-${RESET}\x1b[38;5;203m${m.lines_removed.toLocaleString()}${RESET}` : "";
+    const sep = m.lines_added > 0 && m.lines_removed > 0 ? `  ` : "";
+    lines.push(`${C.hdrLabel}Lines${RESET}      ${addStr}${sep}${remStr}`);
   }
-
-  // ── Cost ──
-  const incl = planIncludesProvider(plan, session.provider);
-  const costVal = incl ? "included" : usd(data.costs.total);
-  const costColor = incl ? C.hdrValue : C.costYellow;
-  const costRate = (session.list_cost_per_min > 0.001)
-    ? `  ${C.hdrLabel}rate${RESET} ${costColor}$${session.list_cost_per_min.toFixed(2)}/m${RESET}`
-    : "";
-  lines.push(`${C.hdrLabel}Cost${RESET}       ${costColor}${costVal}${RESET}${costRate}`);
-
-  // ── Tokens ──
-  const tokIn = compactTokens((data.tokens.input || 0) + (data.tokens.cache_read || data.tokens.cached_input || 0));
-  const tokOut = compactTokens(data.tokens.output);
-  const tokTotal = compactTokens(data.tokens.total);
-  const tokRate = (session.list_tokens_per_min > 0)
-    ? `  ${C.hdrLabel}rate${RESET} ${C.hdrValue}${compactTokens(Math.round(session.list_tokens_per_min))}/m${RESET}`
-    : "";
-  lines.push(`${C.hdrLabel}Tokens${RESET}     ${C.hdrValue}${tokTotal}${RESET}  ${C.hdrLabel}in${RESET} ${C.hdrValue}${tokIn}${RESET}  ${C.hdrLabel}out${RESET} ${C.hdrValue}${tokOut}${RESET}${tokRate}`);
 
   // ── Context headroom ──
   const ctx = session.list_context;
@@ -3600,7 +3819,7 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows) {
       const usedPct = Math.round((ctx.used / compactAt) * 100);
       const usedStr = compactTokens(ctx.used);
       const limitStr = compactTokens(compactAt);
-      lines.push(`${C.hdrLabel}Compaction${RESET} ${pctColor}${String(usedPct).padStart(3)}%${RESET}  ${C.hdrLabel}used${RESET} ${C.hdrValue}${usedStr}${RESET} ${C.hdrLabel}of${RESET} ${C.hdrValue}${limitStr}${RESET}`);
+      lines.push(`${C.hdrLabel}Compaction${RESET} ${pctColor}${String(usedPct).padStart(3)}%${RESET}  ${C.hdrLabel}used${RESET} ${C.hdrValue}${usedStr}${RESET} ${C.hdrLabel}of${RESET} ${C.hdrValue}${limitStr}${RESET} ${C.hdrLabel}tokens${RESET}`);
 
       // Usage bar (filled = used portion relative to compaction threshold)
       if (lines.length < rows - 1) {
@@ -3622,6 +3841,92 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows) {
 
   while (lines.length < rows) lines.push("");
   return lines.slice(0, rows);
+}
+
+/** Cost panel: /cost-style breakdown — total, API duration, wall time, lines, per-model */
+function renderCostPanel(session, data, plan, panelW, rows, scrollTop, state) {
+  const allLines = [];
+  const dimRule = "\x1b[38;5;238m";
+
+  if (!session) {
+    allLines.push(C.dimText + "No session selected" + RESET);
+    while (allLines.length < rows) allLines.push("");
+    return allLines;
+  }
+  if (!data) {
+    allLines.push(C.dimText + "Loading..." + RESET);
+    while (allLines.length < rows) allLines.push("");
+    return allLines;
+  }
+
+  const incl = planIncludesProvider(plan, session.provider);
+  const isClaude = session.provider === "claude";
+
+  // ── Total cost ──
+  const costVal = incl ? "included" : usd(data.costs.total);
+  const totalCostColor = incl ? C.dimText : costColor(data.costs.total);
+  allLines.push(`${C.hdrLabel}Total cost${RESET}    ${totalCostColor}${costVal}${RESET}`);
+  if (!incl && isClaude) {
+    allLines.push(`${C.dimText}  (estimate: token counts × LiteLLM pricing)${RESET}`);
+  }
+
+  // ── Per-model breakdown ──
+  const breakdown = data.modelBreakdown || [];
+  if (breakdown.length > 0) {
+    for (const mb of breakdown) {
+      const modelTotal = parseFloat(mb.total) || 0;
+      const modelTotalColor = costColor(mb.total);
+      const t = mb.tokens || {};
+      const c = mb.costs || {};
+      const cwTok  = (t.cache_write_5m || 0) + (t.cache_write_1h || 0);
+      const cwCost = (c.cache_write_5m || 0) + (c.cache_write_1h || 0);
+      allLines.push("");
+      allLines.push(dimRule + "─".repeat(30) + RESET);
+      allLines.push(`${C.hdrValue}${mb.model}${RESET}  ${modelTotalColor}$${modelTotal.toFixed(2)}${RESET}`);
+      allLines.push(`  ${C.hdrLabel}in${RESET}       ${C.hdrValue}${compactTokens(t.input || 0).padStart(6)}${RESET}  ${C.dimText}$${(c.input || 0).toFixed(4)}${RESET}`);
+      allLines.push(`  ${C.hdrLabel}out${RESET}      ${C.hdrValue}${compactTokens(t.output || 0).padStart(6)}${RESET}  ${C.costYellow}$${(c.output || 0).toFixed(4)}${RESET}`);
+      if ((t.cache_read || 0) > 0) {
+        allLines.push(`  ${C.hdrLabel}cache↓${RESET}   ${C.hdrValue}${compactTokens(t.cache_read || 0).padStart(6)}${RESET}  ${C.dimText}$${(c.cache_read || 0).toFixed(4)}${RESET}`);
+      }
+      if (cwTok > 0) {
+        allLines.push(`  ${C.hdrLabel}cache↑${RESET}   ${C.hdrValue}${compactTokens(cwTok).padStart(6)}${RESET}  ${C.dimText}$${cwCost.toFixed(4)}${RESET}`);
+      }
+    }
+  }
+
+  // Clamp and apply scroll
+  const maxScroll = Math.max(0, allLines.length - rows);
+  const scroll = Math.min(scrollTop || 0, maxScroll);
+  if (state) state.costScroll = scroll;
+
+  // Scrollbar geometry
+  const hasScrollbar = allLines.length > rows;
+  let thumbStart = 0, thumbEnd = 0, thumbSize = 0;
+  if (hasScrollbar && state) {
+    thumbSize = Math.max(1, Math.round((rows / allLines.length) * rows));
+    thumbStart = maxScroll > 0 ? Math.round((scroll / maxScroll) * (rows - thumbSize)) : 0;
+    thumbEnd = thumbStart + thumbSize;
+    state._costScrollbar = { col: panelW - 3, thumbStart, thumbEnd, thumbSize, rows, maxScroll, totalLines: allLines.length };
+  } else if (state) {
+    state._costScrollbar = null;
+  }
+
+  const visible = allLines.slice(scroll, scroll + rows);
+  while (visible.length < rows) visible.push("");
+
+  if (!hasScrollbar || !state) return visible;
+
+  // Append scrollbar column to each line
+  const contentW = panelW - 5; // one less than full content width to make room for scrollbar
+  return visible.map((line, r) => {
+    const isThumb = r >= thumbStart && r < thumbEnd;
+    const padded = ansiSlice(line, 0, contentW);
+    if (isThumb) {
+      const color = (state._costScrollbarHover || state._costScrollbarDrag) ? "\x1b[1;38;5;255m" : "\x1b[38;5;245m";
+      return padded + color + "┃" + RESET;
+    }
+    return padded + "\x1b[38;5;238m│" + RESET;
+  });
 }
 
 /** Center panel: CPU, memory, PIDs with strip charts */
@@ -3817,7 +4122,8 @@ function renderAgentPanel(session, data, panelW, rows, state) {
     rawDetails = [];
     for (const [tName, entries] of Object.entries(m.tool_details)) {
       for (const e of entries) {
-        rawDetails.push({ d: typeof e === "string" ? e : (e.d || ""), ts: typeof e === "string" ? "" : (e.ts || ""), _tool: tName });
+        const base = typeof e === "string" ? { d: e, ts: "" } : e;
+        rawDetails.push({ ...base, _tool: tName });
       }
     }
   } else {
@@ -3837,9 +4143,12 @@ function renderAgentPanel(session, data, panelW, rows, state) {
       })
     : allSorted;
 
-  // Content scroll — default to bottom (newest visible)
+  // Content scroll — stick to bottom unless user has scrolled up
   const maxContentScroll = Math.max(0, sorted.length - contentRows);
-  if (state.agentToolScroll === -1 || state.agentToolScroll > maxContentScroll) {
+  const wasAtBottom = state.agentToolScroll === -1 ||
+    (state._agentPrevMaxScroll !== undefined && state.agentToolScroll >= state._agentPrevMaxScroll);
+  state._agentPrevMaxScroll = maxContentScroll;
+  if (wasAtBottom || state.agentToolScroll > maxContentScroll) {
     state.agentToolScroll = maxContentScroll;
   }
 
@@ -3979,7 +4288,8 @@ function renderAgentPanel(session, data, panelW, rows, state) {
       // Copy icon on the right
       const copyFlash = state._agentCopyFlash === ci && state._agentCopyFlashTs && (now - state._agentCopyFlashTs < 1500);
       const icon = copyFlash ? `\x1b[38;5;114m✓${RESET}` : `\x1b[38;5;60m⧉${RESET}`;
-      state._agentCopyTargets.push({ row: r, value: rawDetail });
+      const copyValue = typeof entry === "string" ? entry : (entry.full || entry.d || "");
+      state._agentCopyTargets.push({ row: r, value: copyValue });
 
       // Tool name prefix for "All" view
       const entryTool = isAllTab ? (entry._tool || "") : "";
@@ -4176,11 +4486,13 @@ function renderHelpView(width, height) {
   lines.push("");
   lines.push(BOLD + "  Tabs:" + RESET);
   lines.push("    Tab              Cycle bottom panel tabs");
-  lines.push("    1, 2, 3, 4       Switch to Info/System/Tools/Config");
-  lines.push("    Shift+Tab / `    Toggle Summary/Live view");
+  lines.push("    1, 2, 3, 4, 5    Switch to Info/Cost/System/Tools/Config");
+  lines.push("    Shift+Tab / `    Toggle Sessions/Live Sessions view");
   lines.push("");
   lines.push(BOLD + "  Other:" + RESET);
-  lines.push("    /, F3            Search / filter sessions");
+  lines.push("    /, F3            Filter sessions by text");
+  lines.push("    F7               Filter sessions by age (1d / 1w / 1mo)");
+  lines.push("    d                Delete selected session (not running)");
   lines.push("    F5, r            Refresh session data");
   lines.push("    F1, ?, h         Show this help");
   lines.push("    q, F10           Quit");
@@ -4202,6 +4514,66 @@ function renderHelpView(width, height) {
 
   while (lines.length < height - 1) lines.push("");
   return lines.slice(0, height - 1);
+}
+
+// ---------------------------------------------------------------------------
+// Delete session
+// ---------------------------------------------------------------------------
+
+function deleteSession(session) {
+  const f = session.data_file;
+  if (!f) return;
+  if (session.provider === "claude") {
+    // Remove main transcript
+    try { rmSync(f); } catch {}
+    // Remove subagent dir (same stem as the .jsonl)
+    const stem = f.replace(/\.jsonl$/, "");
+    try { rmSync(stem, { recursive: true, force: true }); } catch {}
+  } else {
+    // Codex: just the single JSONL file
+    try { rmSync(f); } catch {}
+  }
+  // Evict from in-memory and disk cache
+  const memKey = `${session.provider}:${f}`;
+  SESSION_DATA_CACHE.delete(memKey);
+  SESSION_DATA_MTIME.delete(memKey);
+  const cache = loadDiskCache();
+  for (const k of Object.keys(cache)) {
+    if (k.startsWith(f + "|")) { delete cache[k]; _diskCacheDirty = true; }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Render: delete confirmation overlay
+// ---------------------------------------------------------------------------
+
+function renderDeleteConfirm(session, width) {
+  const modalW = Math.min(60, width - 6);
+  const boxLeft = Math.floor((width - modalW) / 2);
+  const border = "\x1b[38;5;196;48;5;52m"; // red on dark-red
+  const labelC = "\x1b[1;38;5;203;48;5;52m";
+  const pathC = "\x1b[38;5;252;48;5;52m";
+  const hintC = "\x1b[38;5;245;48;5;52m";
+  const inner = modalW - 2;
+
+  const title = " Delete session? ";
+  const name = (session.label || session.session_id || "").slice(0, inner - 4);
+  const hint = "  [y] confirm   [n / Esc] cancel";
+
+  const pad = (s) => {
+    const plain = s.replace(/\x1b\[[^m]*m/g, "");
+    return s + " ".repeat(Math.max(0, inner - plain.length));
+  };
+
+  const topLine    = border + "╭" + "─".repeat(inner) + "╮" + RESET;
+  const titleLine  = border + "│" + RESET + labelC + pad(" " + title) + RESET + border + "│" + RESET;
+  const sepLine    = border + "├" + "─".repeat(inner) + "┤" + RESET;
+  const nameLine   = border + "│" + RESET + pathC + pad("  " + name) + RESET + border + "│" + RESET;
+  const emptyLine  = border + "│" + " ".repeat(inner) + "│" + RESET;
+  const hintLine   = border + "│" + RESET + hintC + pad(hint) + RESET + border + "│" + RESET;
+  const botLine    = border + "╰" + "─".repeat(inner) + "╯" + RESET;
+
+  return { lines: [topLine, titleLine, sepLine, nameLine, emptyLine, hintLine, botLine], boxLeft, modalW };
 }
 
 // ---------------------------------------------------------------------------
@@ -4277,6 +4649,63 @@ function renderSearchModal(state, width) {
 }
 
 // ---------------------------------------------------------------------------
+// Render: inactivity filter modal (F7)
+// ---------------------------------------------------------------------------
+
+const INACTIVITY_OPTIONS = [
+  { key: "1d",  label: "Last 24 hours" },
+  { key: "1w",  label: "Last 7 days"   },
+  { key: "1mo", label: "Last 30 days"  },
+  { key: null,  label: "No filter"     },
+];
+
+function renderInactivityModal(state, width) {
+  const modalW = Math.min(40, width - 6);
+  const boxLeft = Math.floor((width - modalW) / 2);
+  const border = C.border;
+  const inner = modalW - 2; // chars between │ and │
+
+  // Pad a string (may contain ANSI) to exactly `w` plain chars
+  const padTo = (s, w) => {
+    const plain = s.replace(/\x1b\[[^m]*m/g, "");
+    return s + " ".repeat(Math.max(0, w - plain.length));
+  };
+  const row = (content) => border + "│" + RESET + content + border + "│" + RESET;
+
+  const topLine = border + "╭" + "─".repeat(inner) + "╮" + RESET;
+  const botLine = border + "╰" + "─".repeat(inner) + "╯" + RESET;
+  const sepLine = border + "├" + "─".repeat(inner) + "┤" + RESET;
+
+  const titleText = " Age filter ";
+  const titleLine = row(
+    C.colHdrBg + BOLD + padTo(titleText, inner) + RESET
+  );
+
+  const descText = "  Show only sessions active within:";
+  const descLine = row(padTo(C.dimText + descText + RESET, inner));
+
+  const lines = [topLine, titleLine, sepLine, descLine, sepLine];
+
+  for (let i = 0; i < INACTIVITY_OPTIONS.length; i++) {
+    const opt = INACTIVITY_OPTIONS[i];
+    const isActive = state.inactivityFilter === opt.key;
+    const isCursor = state._inactivityCursor === i;
+    const checkC = isActive ? "\x1b[1;38;5;114m" : "\x1b[38;5;240m";
+    const check = checkC + (isActive ? "●" : "○") + RESET;
+    const textC = isCursor ? "\x1b[1;38;5;255;48;5;238m" : (isActive ? "\x1b[38;5;252m" : "\x1b[38;5;245m");
+    const bg    = isCursor ? "\x1b[48;5;238m" : "";
+    const rowInner = bg + padTo(" " + check + " " + textC + opt.label + RESET + bg, inner) + RESET;
+    lines.push(row(rowInner));
+  }
+
+  const hintText = "  ↑/↓  Enter=apply  Esc=cancel";
+  const hintLine = row(padTo(C.dimText + hintText + RESET, inner));
+  lines.push(sepLine, hintLine, botLine);
+
+  return { boxLeft, modalW, lines };
+}
+
+// ---------------------------------------------------------------------------
 // Session list tab bar (posting.sh style)
 // ---------------------------------------------------------------------------
 
@@ -4309,9 +4738,9 @@ function renderListTabBar(state, width) {
     if (i > 0) topLine += "  ";
     const label = tabLabels[i];
     if (i === activeTab) {
-      topLine += "\x1b[1;38;5;255m" + label + RESET;
+      topLine += C.panelTitle + label + RESET;
     } else if (i === hoverTab) {
-      topLine += "\x1b[4;38;5;255m" + label + RESET;
+      topLine += "\x1b[4;38;5;179m" + label + RESET;
     } else {
       topLine += "\x1b[38;5;245m" + label + RESET;
     }
@@ -4391,17 +4820,16 @@ function render(state) {
   // Overview panel (top)
   const headerLines = renderHeader(state.stats || computeStats([]), boxW, state);
   const limitsLines = renderLimitsPanel(boxW, state);
+  const limitsH = limitsLines.length;
 
   // Collect all screen lines
   const screenLines = [];
   for (const line of headerLines) screenLines.push(line);
-  for (const line of limitsLines) screenLines.push(line);
-  const topPanelLines = headerLines.length + limitsLines.length;
-  state.headerLines = topPanelLines; // update for mouse position calculations
+  state.headerLines = headerLines.length; // update for mouse position calculations
 
-  // Bottom panels height (adaptive)
-  const usedByHeader = topPanelLines;
-  const totalBody = height - usedByHeader - 1; // -1 footer
+  // Bottom panels height (adaptive) — reserve space for limits panel at the bottom
+  const usedByHeader = headerLines.length;
+  const totalBody = height - usedByHeader - 1 - limitsH; // -1 footer, -limitsH for limits panel
   const rawPanelH = Math.min(MAX_PANEL, Math.max(MIN_PANEL, Math.floor(totalBody * 0.4)));
   const panelHeight = Math.min(rawPanelH, Math.max(3, totalBody - 5)); // ensure list gets at least 5 rows
   const listAreaH = totalBody - panelHeight;
@@ -4450,6 +4878,9 @@ function render(state) {
   const bottomLines = renderBottomPanels(selected, state.panelData, panelPlan, boxW, panelHeight, state.bottomTab, state.hoverTab, state);
   for (const pl of bottomLines) screenLines.push(pl);
 
+  // Limits panel (below bottom panels)
+  for (const line of limitsLines) screenLines.push(line);
+
   // Overlay sort-by sidebar if in sortby mode
   if (state.mode === "sortby") {
     const sb = renderSortBySidebar(state, width, height);
@@ -4494,6 +4925,49 @@ function render(state) {
         const bgPlain = bgLine.replace(/\x1b\[[^m]*m/g, "");
         const left = ansiSlice(bgLine, 0, sm.boxLeft);
         const rightStart = sm.boxLeft + sm.modalW;
+        const right = rightStart < bgPlain.length
+          ? ansiSlice(bgLine, rightStart, width - rightStart)
+          : " ".repeat(Math.max(0, width - rightStart));
+        screenLines[r] = left + overlay + right + RESET;
+      }
+    }
+  }
+
+  // Overlay delete confirmation
+  if (state.mode === "delete") {
+    const sel = state.sessions[state.selectedRow];
+    if (sel) {
+      const dm = renderDeleteConfirm(sel, width);
+      const startRow = Math.max(0, Math.floor((screenLines.length - dm.lines.length) / 2));
+      for (let r = 0; r < screenLines.length; r++) {
+        const relRow = r - startRow;
+        if (relRow >= 0 && relRow < dm.lines.length) {
+          const overlay = dm.lines[relRow];
+          const bgLine = screenLines[r] || "";
+          const bgPlain = bgLine.replace(/\x1b\[[^m]*m/g, "");
+          const left = ansiSlice(bgLine, 0, dm.boxLeft);
+          const rightStart = dm.boxLeft + dm.modalW;
+          const right = rightStart < bgPlain.length
+            ? ansiSlice(bgLine, rightStart, width - rightStart)
+            : " ".repeat(Math.max(0, width - rightStart));
+          screenLines[r] = left + overlay + right + RESET;
+        }
+      }
+    }
+  }
+
+  // Overlay inactivity filter modal
+  if (state.mode === "inactivity") {
+    const im = renderInactivityModal(state, width);
+    const startRow = Math.max(0, Math.floor((screenLines.length - im.lines.length) / 2));
+    for (let r = 0; r < screenLines.length; r++) {
+      const relRow = r - startRow;
+      if (relRow >= 0 && relRow < im.lines.length) {
+        const overlay = im.lines[relRow];
+        const bgLine = screenLines[r] || "";
+        const bgPlain = bgLine.replace(/\x1b\[[^m]*m/g, "");
+        const left = ansiSlice(bgLine, 0, im.boxLeft);
+        const rightStart = im.boxLeft + im.modalW;
         const right = rightStart < bgPlain.length
           ? ansiSlice(bgLine, rightStart, width - rightStart)
           : " ".repeat(Math.max(0, width - rightStart));
@@ -4579,6 +5053,7 @@ function parseInputSequence(buf) {
   if (buf === "\x1bOR" || buf === "\x1b[13~") return { type: "f3" };
   if (buf === "\x1b[15~") return { type: "f5" };
   if (buf === "\x1b[17~") return { type: "f6" };
+  if (buf === "\x1b[18~") return { type: "f7" };
   if (buf === "\x1b[21~") return { type: "f10" };
 
   // Shift+Tab (backtab)
@@ -4824,6 +5299,49 @@ function handleEvent(event, state) {
     return;
   }
 
+  // --- Inactivity filter mode ---
+  if (state.mode === "inactivity") {
+    if (event.type === "ctrl_c" || event.type === "f10") { state.quit = true; return; }
+    if (event.type === "escape" || event.type === "f7") {
+      state.mode = "list"; state.dirty = true; return;
+    }
+    if (event.type === "up" || (event.type === "char" && event.char === "k")) {
+      state._inactivityCursor = (state._inactivityCursor - 1 + INACTIVITY_OPTIONS.length) % INACTIVITY_OPTIONS.length;
+      state.dirty = true; return;
+    }
+    if (event.type === "down" || (event.type === "char" && event.char === "j")) {
+      state._inactivityCursor = (state._inactivityCursor + 1) % INACTIVITY_OPTIONS.length;
+      state.dirty = true; return;
+    }
+    if (event.type === "enter") {
+      state.inactivityFilter = INACTIVITY_OPTIONS[state._inactivityCursor].key;
+      applySortAndFilter(state);
+      saveUiPrefs({ inactivityFilter: state.inactivityFilter });
+      state.mode = "list"; state.dirty = true; return;
+    }
+    return;
+  }
+
+  // --- Delete confirm mode ---
+  if (state.mode === "delete") {
+    if (event.type === "ctrl_c" || event.type === "f10") { state.quit = true; return; }
+    if (event.type === "escape" || (event.type === "char" && event.char === "n")) {
+      state.mode = "list"; state.dirty = true; return;
+    }
+    if (event.type === "char" && event.char === "y") {
+      const sel = state.filtered[state.selectedRow];
+      if (sel) {
+        deleteSession(sel);
+        // Remove from sessions list and refilter
+        state.sessions = state.sessions.filter(s => s !== sel);
+        state.selectedRow = Math.max(0, Math.min(state.selectedRow, state.sessions.length - 1));
+        applySortAndFilter(state);
+      }
+      state.mode = "list"; state.dirty = true; return;
+    }
+    return;
+  }
+
   // --- Detail mode ---
   if (state.mode === "detail") {
     if (event.type === "char" && event.char === "q") { state.mode = "list"; state.dirty = true; return; }
@@ -4853,6 +5371,11 @@ function handleEvent(event, state) {
         case ">": openSortBy(state); return;
         case "<": openSortBy(state); return;
         case "r": state._needsRefresh = true; return;
+        case "d": {
+          const sel = state.filtered[state.selectedRow];
+          if (sel && !sel.process) { state.mode = "delete"; state.dirty = true; }
+          return;
+        }
         case "P": setSortColumn(state, "status"); return;
         case "M": setSortColumn(state, "mem"); return;
         case "T": setSortColumn(state, "cost"); return;
@@ -4860,6 +5383,7 @@ function handleEvent(event, state) {
         case "2": state.bottomTab = 1; state.dirty = true; saveUiPrefs({ bottomTab: 1, listTab: state.listTab }); return;
         case "3": state.bottomTab = 2; state.dirty = true; saveUiPrefs({ bottomTab: 2, listTab: state.listTab }); return;
         case "4": state.bottomTab = 3; state.dirty = true; saveUiPrefs({ bottomTab: 3, listTab: state.listTab }); return;
+        case "5": state.bottomTab = 4; state.dirty = true; saveUiPrefs({ bottomTab: 4, listTab: state.listTab }); return;
         case "`": switchListTab(state); return;
         default: return;
       }
@@ -4877,6 +5401,12 @@ function handleEvent(event, state) {
     case "f3": state.mode = "search"; state.dirty = true; return;
     case "f5": state._needsRefresh = true; return;
     case "f6": openSortBy(state); return;
+    case "f7": {
+      // Sync cursor to current filter value
+      const idx = INACTIVITY_OPTIONS.findIndex(o => o.key === state.inactivityFilter);
+      state._inactivityCursor = idx >= 0 ? idx : INACTIVITY_OPTIONS.length - 1;
+      state.mode = "inactivity"; state.dirty = true; return;
+    }
   }
 
   // Navigation
@@ -4923,6 +5453,8 @@ function handleEvent(event, state) {
     }
     case "scroll_up":
       if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
+        if (state.costScroll > 0) { state.costScroll--; state.dirty = true; }
+      } else if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
         if (state.configScroll > 0) { state.configScroll--; state.dirty = true; }
       } else if (state.bottomTab === 2 && state._configPanelTop && event.row >= state._configPanelTop) {
         const hoverCol = event.col - 2;
@@ -4938,6 +5470,8 @@ function handleEvent(event, state) {
       return;
     case "scroll_down":
       if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
+        state.costScroll++; state.dirty = true; // clamped in render
+      } else if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
         state.configScroll++; state.dirty = true; // clamped in render
       } else if (state.bottomTab === 2 && state._configPanelTop && event.row >= state._configPanelTop) {
         const hoverCol = event.col - 2;
@@ -4962,6 +5496,43 @@ function handleEvent(event, state) {
       return;
 
     case "click": {
+      // Check footer row FIRST — panel handlers use >= _configPanelTop and would swallow the footer row
+      if (state._footerRow && event.row === state._footerRow) {
+        // Age filter ✕
+        if (state._ageFilterXCol > 0 && event.col >= state._ageFilterXCol && event.col <= state._ageFilterXCol + 1) {
+          state.inactivityFilter = null;
+          saveUiPrefs({ inactivityFilter: null });
+          applySortAndFilter(state);
+          state.dirty = true;
+          return;
+        }
+        // Text filter ✕
+        if (state._filterXCol > 0 && event.col >= state._filterXCol && event.col <= state._filterXCol + 1) {
+          state.searchQuery = "";
+          applySortAndFilter(state);
+          state.dirty = true;
+          return;
+        }
+        // Menu bar items
+        if (state._footerItems) {
+          const item = state._footerItems.find(f => event.col >= f.start && event.col <= f.end);
+          if (item) {
+            switch (item.action) {
+              case "f1": state.mode = "help"; state.dirty = true; break;
+              case "f3": state.mode = "search"; state.dirty = true; break;
+              case "f5": state._needsRefresh = true; break;
+              case "f6": openSortBy(state); break;
+              case "tab": state.bottomTab = (state.bottomTab + 1) % BOTTOM_TABS.length; state.dirty = true; saveUiPrefs({ bottomTab: state.bottomTab, listTab: state.listTab }); break;
+              case "backtick": switchListTab(state); break;
+              case "d_delete": { const sel = state.filtered[state.selectedRow]; if (sel && !sel.process) { state.mode = "delete"; state.dirty = true; } break; }
+              case "f7": { const idx = INACTIVITY_OPTIONS.findIndex(o => o.key === state.inactivityFilter); state._inactivityCursor = idx >= 0 ? idx : INACTIVITY_OPTIONS.length - 1; state.mode = "inactivity"; state.dirty = true; break; }
+              case "f10": state.quit = true; break;
+            }
+            return;
+          }
+        }
+        return;
+      }
       // Check if click is on the list tab bar (top border or underline row)
       if (state._listTabBarRow && (event.row === state._listTabBarRow || event.row === state._listTabBarRow + 1)) {
         const ltIdx = listTabAtX(event.col, state);
@@ -5045,8 +5616,28 @@ function handleEvent(event, state) {
         }
         return; // consume clicks in agent panel area
       }
-      // Check if click is in Config panel area
+      // Check if click is in Cost panel scrollbar
       if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
+        const rowInPanel = event.row - state._configPanelTop;
+        const sb = state._costScrollbar;
+        if (sb && event.col === sb.col) {
+          if (rowInPanel >= sb.thumbStart && rowInPanel < sb.thumbEnd) {
+            state._costScrollbarDrag = true;
+            state._costDragStartRow = rowInPanel;
+            state._costDragStartScroll = state.costScroll;
+            state.dirty = true;
+          } else if (rowInPanel < sb.thumbStart) {
+            state.costScroll = Math.max(0, state.costScroll - sb.rows);
+            state.dirty = true;
+          } else {
+            state.costScroll = Math.min(sb.maxScroll, state.costScroll + sb.rows);
+            state.dirty = true;
+          }
+          return;
+        }
+      }
+      // Check if click is in Config panel area
+      if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
         const selected = state.filtered[state.selectedRow];
         const sections = getSessionConfig(selected);
@@ -5102,32 +5693,6 @@ function handleEvent(event, state) {
           state.dirty = true;
         }
       }
-      // Click on footer row
-      if (state._footerRow && event.row === state._footerRow) {
-        // Filter ✕
-        if (state._filterXCol > 0 && event.col >= state._filterXCol && event.col <= state._filterXCol + 1) {
-          state.searchQuery = "";
-          applySortAndFilter(state);
-          state.dirty = true;
-          return;
-        }
-        // Menu bar items
-        if (state._footerItems) {
-          const item = state._footerItems.find(f => event.col >= f.start && event.col <= f.end);
-          if (item) {
-            switch (item.action) {
-              case "f1": state.mode = "help"; state.dirty = true; break;
-              case "f3": state.mode = "search"; state.dirty = true; break;
-              case "f5": state._needsRefresh = true; break;
-              case "f6": openSortBy(state); break;
-              case "tab": state.bottomTab = (state.bottomTab + 1) % 4; state.dirty = true; saveUiPrefs({ bottomTab: state.bottomTab, listTab: state.listTab }); break;
-              case "backtick": switchListTab(state); break;
-              case "f10": state.quit = true; break;
-            }
-            return;
-          }
-        }
-      }
       return;
     }
 
@@ -5148,6 +5713,17 @@ function handleEvent(event, state) {
       let newConfigHover = -1;
       let newScrollHover = false;
       if (state.bottomTab === 3 && state._configPanelTop) {
+        const rowInPanel = event.row - state._configPanelTop;
+        const sb = state._costScrollbar;
+        if (sb && event.col === sb.col && rowInPanel >= sb.thumbStart && rowInPanel < sb.thumbEnd) {
+          newScrollHover = true;
+        }
+        if (newScrollHover !== state._costScrollbarHover) {
+          state._costScrollbarHover = newScrollHover;
+          state.dirty = true;
+        }
+      }
+      if (state.bottomTab === 4 && state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
         const selected = state.filtered[state.selectedRow];
         const sections = getSessionConfig(selected);
@@ -5181,16 +5757,20 @@ function handleEvent(event, state) {
       if (state._colHeaderRow && event.row === state._colHeaderRow) {
         newColHover = columnAtX(event.col, state.hScroll, state);
       }
-      // Track hover over filter ✕ in footer
+      // Track hover over filter ✕ and age filter ✕ in footer
       let newFilterXHover = false;
-      if (state._footerRow && event.row === state._footerRow && state._filterXCol > 0
-          && event.col >= state._filterXCol && event.col <= state._filterXCol + 1) {
-        newFilterXHover = true;
+      let newAgeXHover = false;
+      if (state._footerRow && event.row === state._footerRow) {
+        if (state._filterXCol > 0 && event.col >= state._filterXCol && event.col <= state._filterXCol + 1)
+          newFilterXHover = true;
+        if (state._ageFilterXCol > 0 && event.col >= state._ageFilterXCol && event.col <= state._ageFilterXCol + 1)
+          newAgeXHover = true;
       }
       if (newHover !== state.hoverTab || newListHover !== state.hoverListTab ||
           newConfigHover !== state.configSubTabHover || newScrollHover !== state._configScrollbarHover ||
           newAgentToolHover !== state.hoverAgentToolTab || newAgentArrowHover !== state._hoverAgentArrow ||
-          newFilterXHover !== state._hoverFilterX || newColHover !== state._hoverColKey) {
+          newFilterXHover !== state._hoverFilterX || newAgeXHover !== state._hoverAgeX ||
+          newColHover !== state._hoverColKey) {
         state.hoverTab = newHover;
         state.hoverListTab = newListHover;
         state.configSubTabHover = newConfigHover;
@@ -5198,6 +5778,7 @@ function handleEvent(event, state) {
         state.hoverAgentToolTab = newAgentToolHover;
         state._hoverAgentArrow = newAgentArrowHover;
         state._hoverFilterX = newFilterXHover;
+        state._hoverAgeX = newAgeXHover;
         state._hoverColKey = newColHover;
         state.dirty = true;
       }
@@ -5205,6 +5786,17 @@ function handleEvent(event, state) {
     }
 
     case "drag": {
+      if (state._costScrollbarDrag && state._costScrollbar && state._configPanelTop) {
+        const sb = state._costScrollbar;
+        const rowInPanel = event.row - state._configPanelTop;
+        const delta = rowInPanel - state._costDragStartRow;
+        const track = sb.rows - sb.thumbSize;
+        if (track > 0) {
+          const scrollDelta = Math.round((delta / track) * sb.maxScroll);
+          state.costScroll = Math.max(0, Math.min(sb.maxScroll, state._costDragStartScroll + scrollDelta));
+          state.dirty = true;
+        }
+      }
       if (state._configScrollbarDrag && state._configScrollbar && state._configPanelTop) {
         const sb = state._configScrollbar;
         const rowInPanel = event.row - state._configPanelTop;
@@ -5221,6 +5813,10 @@ function handleEvent(event, state) {
     }
 
     case "mouseup": {
+      if (state._costScrollbarDrag) {
+        state._costScrollbarDrag = false;
+        state.dirty = true;
+      }
       if (state._configScrollbarDrag) {
         state._configScrollbarDrag = false;
         state.dirty = true;
@@ -5586,6 +6182,11 @@ async function main() {
   if (typeof _savedPrefs.bottomTab === "number") state.bottomTab = _savedPrefs.bottomTab;
   if (typeof _savedPrefs.listTab === "number") state.listTab = _savedPrefs.listTab;
   if (typeof _savedPrefs.agentLiveFilter === "boolean") state.agentLiveFilter = _savedPrefs.agentLiveFilter;
+  if (_savedPrefs.inactivityFilter !== undefined) {
+    state.inactivityFilter = _savedPrefs.inactivityFilter || null;
+    const idx = INACTIVITY_OPTIONS.findIndex(o => o.key === state.inactivityFilter);
+    state._inactivityCursor = idx >= 0 ? idx : INACTIVITY_OPTIONS.length - 1;
+  }
   if (Array.isArray(_savedPrefs.tabSort)) {
     for (let i = 0; i < _savedPrefs.tabSort.length && i < state._tabSort.length; i++) {
       const s = _savedPrefs.tabSort[i];
@@ -5699,6 +6300,7 @@ async function main() {
     if (panelSel && panelSel.session_id !== state._panelSessionId) {
       state._panelSessionId = panelSel.session_id;
       state.panelData = null; // show "Loading..." immediately
+      state.costScroll = 0;
       state.configScroll = 0;
       state.configSubTab = 0;
       state.agentToolTab = 0;
@@ -5706,6 +6308,7 @@ async function main() {
       state.agentTabScroll = 0;
       state._agentToolCounts = {};
       state._agentToolFlash = {};
+      state._agentPrevMaxScroll = undefined;
       render(state);
       state.dirty = false;
       state.panelData = await safeExtractSessionData(panelSel);

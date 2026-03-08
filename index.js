@@ -5069,7 +5069,7 @@ function renderListTabBar(state, width) {
   // Fixed visible widths: ╭(1) ─(1) space(1) title space(1) ─*filler space(1) label space(1) ╮(1) = title+label+7
   const fillerLen = Math.max(0, width - title.length - liveLabel.length - 7);
   let topLine = bc + BOX.tl + BOX.h + " " + RESET;
-  topLine += C.panelTitle + title + RESET + " ";
+  topLine += C.hdrLabel + title + RESET + " ";
   topLine += bc + BOX.h.repeat(fillerLen) + RESET + " ";
   if (isLive) {
     topLine += "\x1b[1;38;5;114m" + liveLabel + RESET;
@@ -5085,8 +5085,7 @@ function renderListTabBar(state, width) {
   const ruleInner = width - 2; // between ╰ and ╯ equivalent (│ on each side)
   let ruleLine = bc + BOX.v + RESET;
   ruleLine += dimRule + "─" + RESET;
-  ruleLine += C.borderHi + "━".repeat(title.length) + RESET;
-  ruleLine += dimRule + "─".repeat(Math.max(0, ruleInner - title.length - 1)) + RESET;
+  ruleLine += dimRule + "─".repeat(ruleInner - 1) + RESET;
   ruleLine += bc + BOX.v + RESET;
 
   return topLine + "\n" + ruleLine;

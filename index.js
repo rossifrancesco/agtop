@@ -1110,6 +1110,8 @@ async function extractCodexSessionData(sessionFile) {
     total_tokens: 0,
   };
   let sawLastUsage = false;
+  const costsByDay  = {}; // "YYYY-MM-DD"    (UTC) → { model: float }
+  const costsByHour = {}; // "YYYY-MM-DDTHH" (UTC) → { model: float }
   const metrics = emptyMetrics();
   const seenCallIds = new Set();
   const seenQueries = new Set();
@@ -1125,6 +1127,20 @@ async function extractCodexSessionData(sessionFile) {
           sawLastUsage = true;
           for (const key of Object.keys(totals)) {
             totals[key] += parseInt(lastUsage[key] || 0, 10) || 0;
+          }
+          // Track cost by day/hour — finalized after pricing is resolved
+          if (item.timestamp) {
+            const d = new Date(item.timestamp);
+            const dateKey = d.toISOString().slice(0, 10);
+            const hourKey = d.toISOString().slice(0, 13);
+            const addTo = (bucket, key) => {
+              if (!bucket[key]) bucket[key] = { inp: 0, cachedInp: 0, out: 0 };
+              bucket[key].inp       += parseInt(lastUsage.input_tokens || 0, 10) || 0;
+              bucket[key].cachedInp += parseInt(lastUsage.cached_input_tokens || 0, 10) || 0;
+              bucket[key].out       += parseInt(lastUsage.output_tokens || 0, 10) || 0;
+            };
+            addTo(costsByDay, dateKey);
+            addTo(costsByHour, hourKey);
           }
         }
       }
@@ -1185,6 +1201,20 @@ async function extractCodexSessionData(sessionFile) {
   const reasoningOutputTokens = totals.reasoning_output_tokens;
   const totalTokens = totals.total_tokens;
 
+  // Convert raw token buckets to per-model cost dicts now that we have pricing
+  const finalizeRaw = (raw) => {
+    const out = {};
+    for (const [key, t] of Object.entries(raw)) {
+      const uncached = Math.max(0, t.inp - t.cachedInp);
+      out[key] = { [model]: tokenCost(uncached, pricing.input_per_million) +
+        tokenCost(t.cachedInp, pricing.cached_input_per_million) +
+        tokenCost(t.out, pricing.output_per_million) };
+    }
+    return out;
+  };
+  const costsByDayFinal  = finalizeRaw(costsByDay);
+  const costsByHourFinal = finalizeRaw(costsByHour);
+
   const inputCost = tokenCost(uncachedInputTokens, pricing.input_per_million);
   const cachedInputCost = tokenCost(
     cachedInputTokens,
@@ -1216,6 +1246,8 @@ async function extractCodexSessionData(sessionFile) {
       cached_input: String(pricing.cached_input_per_million),
       output: String(pricing.output_per_million),
     },
+    costsByDay: costsByDayFinal,
+    costsByHour: costsByHourFinal,
     metrics,
   };
 }
@@ -1242,6 +1274,8 @@ async function extractClaudeSessionData(transcriptPath) {
   const costTotals  = { input: 0, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0, output: 0 };
   const tokensByModel = {}; // model → { input, cache_write_5m, cache_write_1h, cache_read, output }
   const costsByModel  = {}; // model → { input, cache_write_5m, cache_write_1h, cache_read, output }
+  const costsByDay  = {}; // "YYYY-MM-DD"    (UTC) → { model: float }
+  const costsByHour = {}; // "YYYY-MM-DDTHH" (UTC) → { model: float }
   const models = {};
   let lastModel = null;
   const metrics = emptyMetrics();
@@ -1378,22 +1412,22 @@ async function extractClaudeSessionData(transcriptPath) {
         );
 
       const key = requestKey(item, message);
-      const snapshot = { inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, model };
+      const snapshot = { inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, model, ts: item.timestamp || "" };
       if (key !== null) {
         // Overwrite with latest — streaming partials share the same requestId;
         // the final entry has the highest (correct) token counts.
         lastByKey.set(key, snapshot);
       } else {
-        accum(model, inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens);
+        accum(model, inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, item.timestamp || "");
       }
     });
     // Flush the last-occurrence map for this file
-    for (const { inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, model } of lastByKey.values()) {
-      accum(model, inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens);
+    for (const { inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, model, ts } of lastByKey.values()) {
+      accum(model, inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, ts);
     }
   }
 
-  function accum(model, inp, cacheR, out, cw5m, cw1h) {
+  function accum(model, inp, cacheR, out, cw5m, cw1h, ts) {
     lastModel = model;
     models[model] = (models[model] || 0) + 1;
     const pricing = resolveClaudePricing(model);
@@ -1419,6 +1453,21 @@ async function extractClaudeSessionData(transcriptPath) {
     costsByModel[model].output += tokenCost(out, pricing.output_per_million);
     costsByModel[model].cache_write_5m += tokenCost(cw5m, pricing.cache_write_5m_per_million);
     costsByModel[model].cache_write_1h += tokenCost(cw1h, pricing.cache_write_1h_per_million);
+    // Per-day and per-hour cost tracking (UTC), keyed by model
+    if (ts) {
+      const d = new Date(ts);
+      const dateKey = d.toISOString().slice(0, 10);
+      const hourKey = d.toISOString().slice(0, 13);
+      const callCost = tokenCost(inp, pricing.input_per_million) +
+        tokenCost(cacheR, pricing.cache_read_per_million) +
+        tokenCost(out, pricing.output_per_million) +
+        tokenCost(cw5m, pricing.cache_write_5m_per_million) +
+        tokenCost(cw1h, pricing.cache_write_1h_per_million);
+      if (!costsByDay[dateKey])  costsByDay[dateKey]  = {};
+      if (!costsByHour[hourKey]) costsByHour[hourKey] = {};
+      costsByDay[dateKey][model]  = (costsByDay[dateKey][model]  || 0) + callCost;
+      costsByHour[hourKey][model] = (costsByHour[hourKey][model] || 0) + callCost;
+    }
   }
 
   if (!Object.keys(models).length)
@@ -1451,6 +1500,8 @@ async function extractClaudeSessionData(transcriptPath) {
       output: money(costTotals.output),
       total: money(totalCost),
     },
+    costsByDay,
+    costsByHour,
     metrics,
   };
 }
@@ -1663,7 +1714,9 @@ async function safeExtractSessionData(session) {
     && Object.keys(cachedTools).every(t => cachedDetails[t] && cachedDetails[t].length > 0);
   const hasLinesFields = cachedMetrics && typeof cachedMetrics.lines_added !== "undefined";
   const hasModelBreakdown = cache[dKey] && Array.isArray(cache[dKey].modelBreakdown);
-  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown) {
+  // Require costsByHour (v2 format — also implies costsByDay is per-model dict, not flat float)
+  const hasCostsByDay = cache[dKey] && typeof cache[dKey].costsByHour === "object";
+  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay) {
     SESSION_DATA_CACHE.set(memKey, cache[dKey]);
     SESSION_DATA_MTIME.set(memKey, effectiveMtime);
     return cache[dKey];
@@ -1707,6 +1760,8 @@ async function annotateListCosts(sessions, plan) {
         // Update model to the most recently used one
         if (data.lastModel) session.model = data.lastModel;
         else if (data.models && data.models.length) session.model = data.models[data.models.length - 1];
+        session.costs_by_day  = data.costsByDay  || null;
+        session.costs_by_hour = data.costsByHour || null;
       }
       if (planIncludesProvider(plan, session.provider || "")) {
         session.list_total_cost = "included";
@@ -2960,6 +3015,15 @@ function computeStats(sessions) {
   const now = Date.now();
   const h1 = 3600_000, h24 = 86400_000, d7 = 604800_000;
 
+  // Spend windows (UTC boundaries)
+  const nowMs = Date.now();
+  const todayUtc = new Date(nowMs); todayUtc.setUTCHours(0, 0, 0, 0);
+  const todayKey  = todayUtc.toISOString().slice(0, 10);
+  const weekKey   = new Date(todayUtc.getTime() - 6 * 86400_000).toISOString().slice(0, 10);
+  const monthKey  = new Date(todayUtc.getTime() - 29 * 86400_000).toISOString().slice(0, 10);
+  const hourKey   = new Date(nowMs).toISOString().slice(0, 13);
+  let spendToday = 0, spendWeek = 0, spendMonth = 0, spendHour = 0;
+
   let totalCpu = 0, totalMemory = 0, totalTools = 0;
 
   for (const s of sessions) {
@@ -2995,6 +3059,20 @@ function computeStats(sessions) {
       }
     }
 
+    // Spend window accumulation
+    if (s.costs_by_day) {
+      for (const [day, models] of Object.entries(s.costs_by_day)) {
+        const amt = typeof models === "object" ? Object.values(models).reduce((a, b) => a + b, 0) : models;
+        if (day >= monthKey) spendMonth += amt;
+        if (day >= weekKey)  spendWeek  += amt;
+        if (day >= todayKey) spendToday += amt;
+      }
+    }
+    if (s.costs_by_hour) {
+      const amt = s.costs_by_hour[hourKey];
+      if (amt) spendHour += typeof amt === "object" ? Object.values(amt).reduce((a, b) => a + b, 0) : amt;
+    }
+
     if (s.model) {
       // Shorten model name for stats display
       const short = s.model.replace(/^claude-/, "").replace(/-202\d+$/, "");
@@ -3020,6 +3098,7 @@ function computeStats(sessions) {
     totalTools,
     spendTotal: spendClaude + spendCodex,
     spendClaude, spendCodex,
+    spendHour, spendToday, spendWeek, spendMonth,
     models,
     uptime,
   };
@@ -3862,36 +3941,113 @@ function renderCostPanel(session, data, plan, panelW, rows, scrollTop, state) {
   const incl = planIncludesProvider(plan, session.provider);
   const isClaude = session.provider === "claude";
 
-  // ── Total cost ──
+  const fmtAmt = (v) => v < 0.01 && v > 0 ? `$${v.toFixed(4)}` : `$${v.toFixed(2)}`;
+  const shortModel = (m) => m.replace(/^claude-/, "").replace(/-\d{8}$/, "").replace(/^gpt-/, "");
+
+  // ── LEFT: Total cost + spend windows ──
+  const leftLines = [];
   const costVal = incl ? "included" : usd(data.costs.total);
   const totalCostColor = incl ? C.dimText : costColor(data.costs.total);
-  allLines.push(`${C.hdrLabel}Total cost${RESET}    ${totalCostColor}${costVal}${RESET}`);
+  leftLines.push(`${C.hdrLabel}Total cost${RESET}  ${totalCostColor}${costVal}${RESET}`);
   if (!incl && isClaude) {
-    allLines.push(`${C.dimText}  (estimate: token counts × LiteLLM pricing)${RESET}`);
+    leftLines.push(`${C.dimText}  (est: tokens × LiteLLM)${RESET}`);
   }
 
-  // ── Per-model breakdown ──
-  const breakdown = data.modelBreakdown || [];
-  if (breakdown.length > 0) {
-    for (const mb of breakdown) {
-      const modelTotal = parseFloat(mb.total) || 0;
-      const modelTotalColor = costColor(mb.total);
-      const t = mb.tokens || {};
-      const c = mb.costs || {};
-      const cwTok  = (t.cache_write_5m || 0) + (t.cache_write_1h || 0);
-      const cwCost = (c.cache_write_5m || 0) + (c.cache_write_1h || 0);
-      allLines.push("");
-      allLines.push(dimRule + "─".repeat(30) + RESET);
-      allLines.push(`${C.hdrValue}${mb.model}${RESET}  ${modelTotalColor}$${modelTotal.toFixed(2)}${RESET}`);
-      allLines.push(`  ${C.hdrLabel}in${RESET}       ${C.hdrValue}${compactTokens(t.input || 0).padStart(6)}${RESET}  ${C.dimText}$${(c.input || 0).toFixed(4)}${RESET}`);
-      allLines.push(`  ${C.hdrLabel}out${RESET}      ${C.hdrValue}${compactTokens(t.output || 0).padStart(6)}${RESET}  ${C.costYellow}$${(c.output || 0).toFixed(4)}${RESET}`);
-      if ((t.cache_read || 0) > 0) {
-        allLines.push(`  ${C.hdrLabel}cache↓${RESET}   ${C.hdrValue}${compactTokens(t.cache_read || 0).padStart(6)}${RESET}  ${C.dimText}$${(c.cache_read || 0).toFixed(4)}${RESET}`);
+  if (!incl && (data.costsByDay || data.costsByHour)) {
+    const nowMs = Date.now();
+    const todayUtc = new Date(nowMs); todayUtc.setUTCHours(0, 0, 0, 0);
+    const todayKey = todayUtc.toISOString().slice(0, 10);
+    const weekKey  = new Date(todayUtc.getTime() - 6 * 86400_000).toISOString().slice(0, 10);
+    const monthKey = new Date(todayUtc.getTime() - 29 * 86400_000).toISOString().slice(0, 10);
+    const hourKey  = new Date(nowMs).toISOString().slice(0, 13);
+
+    const mergeInto = (acc, dict) => {
+      for (const [m, v] of Object.entries(dict || {})) acc[m] = (acc[m] || 0) + v;
+    };
+    const hourModels = {}, todayModels = {}, weekModels = {}, monthModels = {};
+    if (data.costsByHour) {
+      const h = data.costsByHour[hourKey];
+      if (h) mergeInto(hourModels, typeof h === "object" ? h : { _: h });
+    }
+    for (const [day, models] of Object.entries(data.costsByDay || {})) {
+      const dict = typeof models === "object" ? models : { _: models };
+      if (day >= monthKey) mergeInto(monthModels, dict);
+      if (day >= weekKey)  mergeInto(weekModels,  dict);
+      if (day >= todayKey) mergeInto(todayModels, dict);
+    }
+
+    const totalOf = (d) => Object.values(d).reduce((a, b) => a + b, 0);
+    const renderWindow = (label, modelMap) => {
+      const tot = totalOf(modelMap);
+      leftLines.push(`  ${C.hdrLabel}${label}${RESET}    ${costColor(tot)}${fmtAmt(tot)}${RESET}`);
+      for (const [m, v] of Object.entries(modelMap).sort((a, b) => b[1] - a[1])) {
+        if (m === "_") continue;
+        leftLines.push(`    ${C.hdrValue}${shortModel(m)}${RESET}  ${costColor(v)}${fmtAmt(v)}${RESET}`);
       }
-      if (cwTok > 0) {
-        allLines.push(`  ${C.hdrLabel}cache↑${RESET}   ${C.hdrValue}${compactTokens(cwTok).padStart(6)}${RESET}  ${C.dimText}$${cwCost.toFixed(4)}${RESET}`);
+    };
+
+    renderWindow("last hour", hourModels);
+    renderWindow("today",     todayModels);
+    renderWindow("7 days",    weekModels);
+    renderWindow("30 days",   monthModels);
+  }
+
+  // ── RIGHT: Model breakdown ──
+  const rightLines = [];
+  if (!incl) {
+    if (isClaude && data.modelBreakdown && data.modelBreakdown.length > 0) {
+      for (const mb of data.modelBreakdown) {
+        const modelTotal = parseFloat(mb.total) || 0;
+        const modelTotalColor = costColor(mb.total);
+        const t = mb.tokens || {};
+        const c = mb.costs  || {};
+        const cwTok  = (t.cache_write_5m || 0) + (t.cache_write_1h || 0);
+        const cwCost = (c.cache_write_5m || 0) + (c.cache_write_1h || 0);
+        rightLines.push(dimRule + "─".repeat(30) + RESET);
+        rightLines.push(`${C.hdrValue}${mb.model}${RESET}  ${modelTotalColor}$${modelTotal.toFixed(2)}${RESET}`);
+        rightLines.push(`  ${C.hdrLabel}in${RESET}       ${C.hdrValue}${compactTokens(t.input || 0).padStart(6)}${RESET}  ${costColor(c.input || 0)}$${(c.input || 0).toFixed(4)}${RESET}`);
+        rightLines.push(`  ${C.hdrLabel}out${RESET}      ${C.hdrValue}${compactTokens(t.output || 0).padStart(6)}${RESET}  ${costColor(c.output || 0)}$${(c.output || 0).toFixed(4)}${RESET}`);
+        if ((t.cache_read || 0) > 0) {
+          rightLines.push(`  ${C.hdrLabel}cache↓${RESET}   ${C.hdrValue}${compactTokens(t.cache_read || 0).padStart(6)}${RESET}  ${costColor(c.cache_read || 0)}$${(c.cache_read || 0).toFixed(4)}${RESET}`);
+        }
+        if (cwTok > 0) {
+          rightLines.push(`  ${C.hdrLabel}cache↑${RESET}   ${C.hdrValue}${compactTokens(cwTok).padStart(6)}${RESET}  ${costColor(cwCost)}$${cwCost.toFixed(4)}${RESET}`);
+        }
+      }
+    } else if (!isClaude) {
+      // Codex: single model token/cost breakdown
+      const model = data.model || "";
+      const t = data.tokens || {};
+      const c = data.costs  || {};
+      const r = data.rates  || {};
+      const totalColor = costColor(data.costs.total);
+      if (model) {
+        rightLines.push(dimRule + "─".repeat(30) + RESET);
+        rightLines.push(`${C.hdrValue}${shortModel(model)}${RESET}  ${totalColor}${usd(data.costs.total)}${RESET}`);
+      }
+      rightLines.push(`  ${C.hdrLabel}in${RESET}       ${C.hdrValue}${compactTokens(t.input || 0).padStart(6)}${RESET}  ${costColor(parseFloat(c.input || 0))}$${parseFloat(c.input || 0).toFixed(4)}${RESET}`);
+      if ((t.cached_input || 0) > 0) {
+        rightLines.push(`  ${C.hdrLabel}cached${RESET}   ${C.hdrValue}${compactTokens(t.cached_input || 0).padStart(6)}${RESET}  ${costColor(parseFloat(c.cached_input || 0))}$${parseFloat(c.cached_input || 0).toFixed(4)}${RESET}`);
+      }
+      rightLines.push(`  ${C.hdrLabel}out${RESET}      ${C.hdrValue}${compactTokens(t.output || 0).padStart(6)}${RESET}  ${costColor(parseFloat(c.output || 0))}$${parseFloat(c.output || 0).toFixed(4)}${RESET}`);
+      if (r.input) {
+        rightLines.push(`  ${C.dimText}rates: in $${r.input}  out $${r.output}${RESET}`);
       }
     }
+  }
+
+  // ── Combine left + right side by side ──
+  const sepCol = Math.floor((panelW - 2) / 2);
+  const rightStart = sepCol + 2; // after "│ "
+  const rightW = panelW - rightStart;
+  const totalL = Math.max(leftLines.length, rightLines.length);
+  const padTo = (line, w) => {
+    const plain = (line || "").replace(/\x1b\[[^m]*m/g, "");
+    return (line || "") + " ".repeat(Math.max(0, w - plain.length));
+  };
+  const divider = "\x1b[38;5;238m│\x1b[0m ";
+  for (let i = 0; i < totalL; i++) {
+    allLines.push(padTo(leftLines[i] || "", sepCol) + divider + (rightLines[i] || ""));
   }
 
   // Clamp and apply scroll

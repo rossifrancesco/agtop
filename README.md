@@ -1,22 +1,28 @@
 # agtop
 
-An htop-like TUI for monitoring AI coding agent sessions. Tracks Claude Code and Codex sessions running on your machine, showing real-time cost, token usage, tool invocations, and OS-level metrics.
+Your window into what your AI coding agents are actually doing. agtop is an htop-style terminal dashboard that tracks every Claude Code and Codex session on your machine — spend, token usage, context pressure, CPU load, tool invocations, and more — all in one place, live.
 
 ![agtop](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
+
+```
+npx github:ldegio/agtop
+```
+
+![agtop screenshot](screenshot.png)
 
 ## Features
 
 - **Session discovery** -- automatically finds Claude Code (`~/.claude/projects/`) and Codex (`~/.codex/sessions/`) sessions
-- **Cost estimation** -- computes per-session spend using LiteLLM pricing data, with plan-aware billing (retail, max, included)
-- **Two list views** -- Summary (all sessions: duration, tokens, cost, tools, model) and Live (running sessions: CPU, memory, rates, incremental tool count)
-- **Real-time rates** -- tokens/min and cost/min via EMA smoothing; incremental tool count since startup
-- **OS process metrics** -- CPU%, memory, PID count for running sessions (macOS/Linux)
-- **Last active tool** -- shows what a running agent is doing right now
-- **Overview charts** -- sparkline charts for aggregate spend, tokens, and CPU
-- **Detail view** -- full cost breakdown, token split, and per-model stats
-- **Tabbed panels** -- Info (identity, cost, tokens), System (CPU/memory charts), Tool Activity, Config (CLAUDE.md/AGENTS.md, memories, skills, MCP servers, permissions)
-- **Mouse support** -- click to select sessions, sort by column, switch tabs, clickable menu bar; hover tooltips on column headers
-- **Non-interactive modes** -- list table and full JSON dump for scripting
+- **Cost tracking** -- per-session spend with hourly and daily breakdowns; plan-aware billing (retail, Max, included)
+- **Context pressure** -- CTX% shows how full each agent's context window is
+- **Live toggle** -- filter to running sessions with real-time CPU%, cost rates, and incremental tool counts
+- **Tool Activity panel** -- scrollable per-tool invocation history with timestamps; see exactly what each agent has been doing
+- **OS process metrics** -- CPU% and PID count for running sessions (macOS/Linux)
+- **Overview sparklines** -- aggregate spend, tokens, and CPU charts at a glance
+- **Detail view** -- full cost breakdown, token split, per-model stats, and complete tool history
+- **Config panel** -- browse CLAUDE.md/AGENTS.md, memories, skills, MCP servers, and permissions per session
+- **Mouse support** -- click to select, sort by column, switch tabs; hover tooltips on column headers
+- **Non-interactive modes** -- table and full JSON dump for scripting
 
 ## Requirements
 
@@ -27,7 +33,10 @@ An htop-like TUI for monitoring AI coding agent sessions. Tracks Claude Code and
 
 ```
 # Interactive TUI (default)
-agtop
+npx github:ldegio/agtop
+
+# Or install globally
+npm install -g github:ldegio/agtop
 
 # List sessions in a table
 agtop -l
@@ -60,11 +69,10 @@ agtop -d 3
 | `j`/`k` or arrows | Navigate sessions |
 | `Enter` | Open detail view |
 | `Tab` | Cycle bottom panel tabs |
-| `Shift+Tab` or `` ` `` | Toggle Summary/Live view |
+| `Shift+Tab` or `` ` `` | Toggle Live filter |
 | `1`/`2`/`3`/`4` | Switch to Info/System/Tool Activity/Config panel |
 | `F3` or `/` | Search/filter sessions |
 | `F6` or `>` | Sort-by panel |
-| `P`/`M`/`T` | Sort by status/memory/cost |
 | `F5` or `r` | Force refresh |
 | `q` or `F10` | Quit |
 
@@ -81,7 +89,7 @@ The `-p` flag controls how costs are displayed:
 `agtop -j` dumps comprehensive session data including:
 
 - Session identity (provider, ID, project, model)
-- Cost breakdown (total, per-category, rates)
+- Cost breakdown (total, per-category, hourly/daily rates)
 - Token counts (input, output, cached, detailed splits)
 - Activity metrics (tool invocations by name, skills, web fetches/searches, MCP calls)
 

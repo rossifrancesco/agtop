@@ -5068,7 +5068,7 @@ function renderListTabBar(state, width) {
   // Top border: ╭─ <title> ─────── [Live ○] ╮
   // Fixed visible widths: ╭(1) ─(1) space(1) title space(1) ─*filler space(1) label space(1) ╮(1) = title+label+7
   const fillerLen = Math.max(0, width - title.length - liveLabel.length - 7);
-  let topLine = bc + BOX.tl + BOX.h + " " + RESET;
+  let topLine = bc + BOX.h + BOX.h + " " + RESET;
   topLine += C.hdrLabel + title + RESET + " ";
   topLine += bc + BOX.h.repeat(fillerLen) + RESET + " ";
   if (isLive) {
@@ -5078,7 +5078,7 @@ function renderListTabBar(state, width) {
   } else {
     topLine += "\x1b[38;5;245m" + liveLabel + RESET;
   }
-  topLine += " " + bc + BOX.tr + RESET;
+  topLine += " " + bc + BOX.h + RESET;
 
   return topLine;
 }
@@ -5176,8 +5176,6 @@ function render(state) {
       }
     }
   }
-  screenLines.push(boxBottom(boxW));
-
   // Bottom detail panels (tabbed)
   const selected = list[state.selectedRow] || null;
   const panelPlan = selected ? (selected.provider === "codex" ? state.codexPlan : state.claudePlan) : null;

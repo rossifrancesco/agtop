@@ -2547,12 +2547,12 @@ const COL_CTX = {
 };
 const COL_COST_HOUR = {
   key: "cost_hour", label: "$/1H", width: 7, align: "right", desc: "Cost in the last hour",
-  render: (s) => s.list_cost_hour > 0 ? compactUsd(s.list_cost_hour) : "",
+  render: (s) => s.list_cost_hour > 0 ? compactUsd(s.list_cost_hour) : "\x1b[38;5;238m─\x1b[0m",
   compare: (a, b) => (a.list_cost_hour || 0) - (b.list_cost_hour || 0),
 };
 const COL_COST_TODAY = {
   key: "cost_today", label: "$/1D", width: 7, align: "right", desc: "Cost since midnight (local time)",
-  render: (s) => s.list_cost_today > 0 ? compactUsd(s.list_cost_today) : "",
+  render: (s) => s.list_cost_today > 0 ? compactUsd(s.list_cost_today) : "\x1b[38;5;238m─\x1b[0m",
   compare: (a, b) => (a.list_cost_today || 0) - (b.list_cost_today || 0),
 };
 const COL_PROJECT = {
@@ -2562,7 +2562,7 @@ const COL_PROJECT = {
 };
 
 const SESSION_COLUMNS = [
-  COL_STATUS, COL_LAST, COL_DURATION, COL_MODEL, COL_COST, COL_COST_HOUR, COL_COST_TODAY, COL_TOOLS, COL_CTX, COL_CPU, COL_PROJECT,
+  COL_STATUS, COL_LAST, COL_DURATION, COL_COST, COL_COST_HOUR, COL_COST_TODAY, COL_CTX, COL_CPU, COL_TOOLS, COL_MODEL, COL_PROJECT,
 ];
 
 // Legacy aliases kept for non-interactive output and sort restore
@@ -3146,6 +3146,7 @@ function createState() {
     configSubTab: 0, // active sub-tab in Config panel
     costScroll: 0, // scroll offset in Cost panel content
     _costScrollbar: null, // scrollbar geometry for Cost panel
+    _agentScrollbar: null, // scrollbar geometry for Tool Activity panel
     _costScrollbarHover: false,
     _costScrollbarDrag: false,
     _costDragStartRow: 0,
@@ -4431,7 +4432,7 @@ function renderAgentPanel(session, data, panelW, rows, state) {
   }
 
   // Content area
-  const contentW = panelW - 4 - AGENT_TAB_WIDTH - 1; // inner width minus tab sidebar minus separator
+  let contentW = panelW - 4 - AGENT_TAB_WIDTH - 1; // inner width minus tab sidebar minus separator
   const HOME = process.env.HOME || "";
 
   // Compute per-tool live counts (entries since agtop started)
@@ -4489,6 +4490,19 @@ function renderAgentPanel(session, data, panelW, rows, state) {
   state._agentPrevMaxScroll = maxContentScroll;
   if (wasAtBottom || state.agentToolScroll > maxContentScroll) {
     state.agentToolScroll = maxContentScroll;
+  }
+
+  // Scrollbar geometry (computed before loop so contentW can be adjusted)
+  const hasScrollbar = sorted.length > contentRows;
+  if (hasScrollbar) contentW -= 1;
+  let sbThumbStart = 0, sbThumbEnd = 0;
+  if (hasScrollbar) {
+    const sbThumbSize = Math.max(1, Math.round((contentRows / sorted.length) * contentRows));
+    sbThumbStart = maxContentScroll > 0 ? Math.round((state.agentToolScroll / maxContentScroll) * (contentRows - sbThumbSize)) : 0;
+    sbThumbEnd = sbThumbStart + sbThumbSize;
+    state._agentScrollbar = { thumbStart: sbThumbStart, thumbEnd: sbThumbEnd, thumbSize: sbThumbSize, contentRows, rows, maxScroll: maxContentScroll, col: panelW - 3 };
+  } else {
+    state._agentScrollbar = null;
   }
 
   // Detect count changes and trigger flash
@@ -4655,6 +4669,13 @@ function renderAgentPanel(session, data, panelW, rows, state) {
       line += " ".repeat(fillLen) + " " + icon;
     } else {
       line += " ".repeat(contentW);
+    }
+
+    // Append scrollbar character for content rows (r >= 1)
+    if (hasScrollbar) {
+      const trackPos = r - 1; // 0-based track position
+      const isThumb = trackPos >= sbThumbStart && trackPos < sbThumbEnd;
+      line += isThumb ? "\x1b[38;5;245m┃" + RESET : "\x1b[38;5;238m│" + RESET;
     }
 
     lines.push(line);
@@ -5926,6 +5947,20 @@ function handleEvent(event, state) {
             saveUiPrefs({ bottomTab: state.bottomTab, listTab: state.listTab, tabSort: state._tabSort, agentLiveFilter: state.agentLiveFilter });
             return;
           }
+        }
+        // Click on scrollbar track
+        const sb = state._agentScrollbar;
+        if (sb && event.col === sb.col) {
+          const trackPos = rowInPanel - 1; // 0-based, skip header row
+          if (trackPos >= 0) {
+            if (trackPos < sb.thumbStart) {
+              state.agentToolScroll = Math.max(0, state.agentToolScroll - sb.contentRows);
+            } else if (trackPos >= sb.thumbEnd) {
+              state.agentToolScroll = Math.min(sb.maxScroll, state.agentToolScroll + sb.contentRows);
+            }
+            state.dirty = true;
+          }
+          return;
         }
         // Click on copy icon (rightmost area of content)
         const copyTarget = state._agentCopyTargets.find(t => t.row === rowInPanel);

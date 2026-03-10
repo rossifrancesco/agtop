@@ -296,6 +296,9 @@ async function forEachJsonl(filePath, callback) {
       // Yield to the event loop every 1000 lines so UI input isn't blocked
       // by large transcript files during background refresh.
       if (lineNum % 1000 === 0) await new Promise(r => setImmediate(r));
+      // Skip lines >512KB — these are almost always base64 image payloads
+      // and contain no token/cost/tool data worth extracting.
+      if (raw.length > 524_288) continue;
       const line = raw.trim();
       if (!line) continue;
       let item;

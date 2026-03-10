@@ -304,10 +304,8 @@ async function forEachJsonl(filePath, callback) {
       let item;
       try {
         item = JSON.parse(line);
-      } catch (err) {
-        throw new SessionCostError(
-          `Invalid JSON in ${filePath} at line ${lineNum}: ${err.message}`
-        );
+      } catch {
+        continue; // skip corrupted/truncated lines (e.g. null-byte padding)
       }
       callback(item);
     }

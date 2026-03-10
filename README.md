@@ -1,14 +1,14 @@
 # agtop
 
-Your window into what your AI coding agents are actually doing. agtop is an htop-style terminal dashboard that tracks every Claude Code and Codex session on your machine — spend, token usage, context pressure, CPU load, tool invocations, and more — all in one place, live.
-
-![agtop](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
-
 ```
 npx github:ldegio/agtop
 ```
 
-![agtop screenshot](screenshot.png)
+Your window into what your AI coding agents are actually doing. agtop is a top-style terminal dashboard that tracks every Claude Code and Codex session on your machine — spend, token usage, context pressure, CPU load, tool invocations, and more — all in one place, live.
+
+![agtop](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
+
+![Session list with live CPU and cost metrics](screenshots/main-list.png)
 
 ## Features
 
@@ -32,21 +32,14 @@ npx github:ldegio/agtop
 ## Usage
 
 ```
-# Interactive TUI (default)
+# Run the TUI (no install needed)
 npx github:ldegio/agtop
 
 # Or install globally
 npm install -g github:ldegio/agtop
 
-# List sessions in a table
-agtop -l
-
-# Full JSON dump (pipe to jq for filtering)
-agtop -j
-agtop -j | jq '.[] | select(.cost.total > "1.00")'
-
-# Set billing plan
-agtop -p max
+# Run the installed version
+agtop
 
 # Set refresh interval (seconds)
 agtop -d 3
@@ -76,14 +69,6 @@ agtop -d 3
 | `F5` or `r` | Force refresh |
 | `q` or `F10` | Quit |
 
-## Plans
-
-The `-p` flag controls how costs are displayed:
-
-- `retail` (default) -- standard API pricing
-- `max` -- Claude Max subscription (Claude usage marked as "included")
-- `included` -- all usage marked as included
-
 ## JSON Output
 
 `agtop -j` dumps comprehensive session data including:
@@ -92,6 +77,24 @@ The `-p` flag controls how costs are displayed:
 - Cost breakdown (total, per-category, hourly/daily rates)
 - Token counts (input, output, cached, detailed splits)
 - Activity metrics (tool invocations by name, skills, web fetches/searches, MCP calls)
+
+## Screenshots
+
+**Info panel** — session identity, wall/API time, context pressure
+
+![Info panel](screenshots/panel-info.png)
+
+**Tool Activity** — per-tool invocation counts and live feed with timestamps
+
+![Tool Activity panel](screenshots/panel-tool-activity.png)
+
+**Cost breakdown** — total spend by time window, per-model token and cost split
+
+![Cost panel](screenshots/panel-cost.png)
+
+**Config** — browse CLAUDE.md, memories, skills, MCP servers, and permissions
+
+![Config panel](screenshots/panel-config.png)
 
 ## How It Works
 

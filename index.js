@@ -1299,13 +1299,16 @@ async function extractClaudeSessionData(transcriptPath) {
   const costsByHour = {}; // "YYYY-MM-DDTHH" (UTC) → { model: float }
   const models = {};
   let lastModel = null;
+  let lastMainModel = null; // model from main session file only (excludes subagent sidechains)
   const metrics = emptyMetrics();
   const seenToolIds = new Set();
   const seenUrls = new Set();
   const seenQueries = new Set();
   const CMD_RE = /<command-name>\/?([^<]+)<\/command-name>/g;
 
-  for (const filePath of claudeTranscriptFiles(transcriptPath)) {
+  const transcriptFiles = claudeTranscriptFiles(transcriptPath);
+  for (const [fileIdx, filePath] of transcriptFiles.entries()) {
+    const isMainFile = fileIdx === 0;
     // Map of requestId → latest token snapshot (streaming writes same requestId multiple times;
     // the last entry has final token counts — keep that one, discard earlier partials).
     const lastByKey = new Map();
@@ -1439,17 +1442,18 @@ async function extractClaudeSessionData(transcriptPath) {
         // the final entry has the highest (correct) token counts.
         lastByKey.set(key, snapshot);
       } else {
-        accum(model, inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, item.timestamp || "");
+        accum(model, inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, item.timestamp || "", isMainFile);
       }
     });
     // Flush the last-occurrence map for this file
     for (const { inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, model, ts } of lastByKey.values()) {
-      accum(model, inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, ts);
+      accum(model, inputTokens, cacheReadTokens, outputTokens, cacheWrite5mTokens, cacheWrite1hTokens, ts, isMainFile);
     }
   }
 
-  function accum(model, inp, cacheR, out, cw5m, cw1h, ts) {
+  function accum(model, inp, cacheR, out, cw5m, cw1h, ts, isMain) {
     lastModel = model;
+    if (isMain) lastMainModel = model;
     models[model] = (models[model] || 0) + 1;
     const pricing = resolveClaudePricing(model);
     tokenTotals.input += inp;
@@ -1509,7 +1513,7 @@ async function extractClaudeSessionData(transcriptPath) {
 
   return {
     provider: "claude",
-    lastModel,
+    lastModel: lastMainModel || lastModel,
     models: Object.keys(models).sort(),
     modelBreakdown,
     tokens: { ...tokenTotals, total: totalTokens },
@@ -1525,6 +1529,7 @@ async function extractClaudeSessionData(transcriptPath) {
     costsByHour,
     metrics,
     _localDates: true,
+    _noSubagentModel: true, // cache bust: lastModel now excludes subagent sidechain files
   };
 }
 
@@ -1739,7 +1744,8 @@ async function safeExtractSessionData(session) {
   // Require costsByHour (v2 format — also implies costsByDay is per-model dict, not flat float)
   const hasCostsByDay = cache[dKey] && typeof cache[dKey].costsByHour === "object";
   const hasLocalDates = cache[dKey] && cache[dKey]._localDates === true;
-  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates) {
+  const hasNoSubagentModel = cache[dKey] && cache[dKey]._noSubagentModel === true;
+  if (dKey && cache[dKey] && detailsValid && hasLinesFields && hasModelBreakdown && hasCostsByDay && hasLocalDates && hasNoSubagentModel) {
     SESSION_DATA_CACHE.set(memKey, cache[dKey]);
     SESSION_DATA_MTIME.set(memKey, effectiveMtime);
     return cache[dKey];
@@ -1780,9 +1786,8 @@ async function annotateListCosts(sessions, plan) {
         session.list_output_tokens = t.output || 0;
         const m = safeMetrics(data);
         session.list_tool_count = m.tool_count;
-        // Update model to the most recently used one
+        // Update displayed model from full extraction (lastModel excludes subagent sidechain files)
         if (data.lastModel) session.model = data.lastModel;
-        else if (data.models && data.models.length) session.model = data.models[data.models.length - 1];
         session.costs_by_day  = data.costsByDay  || null;
         session.costs_by_hour = data.costsByHour || null;
         // Pre-compute per-session spend for last-hour and today columns
@@ -3676,12 +3681,18 @@ function renderSessionRow(session, index, isSelected, width, now, hScroll, state
       }
       state._colPrev[skey][col.key] = cur;
       const flashTs = (state._colFlash[skey] && state._colFlash[skey][col.key]) || 0;
-      if (flashTs && (now - flashTs < 1500)) colColor = "\x1b[1;38;5;105m";
+      if (flashTs && (now - flashTs < 1500)) {
+        colColor = "\x1b[1;38;5;105m";
+      } else if (col.key === "cost_hour" && session.list_cost_hour > 0) {
+        colColor = costColor(session.list_cost_hour);
+      } else if (col.key === "cost_today" && session.list_cost_today > 0) {
+        colColor = costColor(session.list_cost_today);
+      }
     }
     if (colColor) {
       line += bg + colColor + text + RESET + base;
     } else {
-      line += text;
+      line += text + base; // re-apply selection bg after any embedded RESET in text
     }
 
     used += w;
@@ -4012,10 +4023,11 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows) {
     : C.hdrValue;
   lines.push(`${C.hdrLabel}Type${RESET}       ${provColor}${prov}${RESET}  ${C.hdrLabel}Model${RESET} ${mdlColor}${displayModel}${RESET}`);
   addCopyLine("ID", shortSid, sid, "id", 9);
-  if (pm && pm.command) {
+  {
+    const fullCmd = (pm && pm.command) || (session.provider === "claude" ? `claude --resume ${sid}` : `codex --resume ${sid}`);
     const maxCmdW = w - 12;
-    const cmd = pm.command.length > maxCmdW ? pm.command.slice(0, maxCmdW - 3) + "..." : pm.command;
-    addCopyLine("Cmd", cmd, pm.command, "cmd", 9);
+    const cmd = fullCmd.length > maxCmdW ? fullCmd.slice(0, maxCmdW - 3) + "..." : fullCmd;
+    addCopyLine("Cmd", cmd, fullCmd, "cmd", 9);
   }
 
   // ── Location ──
@@ -4720,14 +4732,14 @@ function renderConfigPanel(session, panelW, rows, state) {
   const activeSection = sections[state.configSubTab];
   const contentW = panelW - 4 - CONFIG_TAB_WIDTH - 1; // inner width minus tab sidebar minus separator
 
-  // Build content lines for the active section, with word wrapping
+  // Build content lines for the active section — one display line per source line, clipped with …
   const rawLines = activeSection ? activeSection.lines : [];
   const contentLines = [];
+  const clipW = contentW - 2; // -2 for leading space + margin
   for (const rl of rawLines) {
-    // Strip control chars (tabs, CR, etc.) but preserve ANSI color codes
     const cleaned = rl.replace(/\t/g, "    ").replace(/[\r\n]/g, "").replace(/[\x00-\x08\x0b\x0c\x0e-\x1a]/g, "");
-    const wrapped = wrapLine(cleaned, contentW - 2); // -2 for leading space + margin
-    for (const wl of wrapped) contentLines.push(wl);
+    const vLen = ansiLen(cleaned);
+    contentLines.push(vLen > clipW ? ansiSlice(cleaned, 0, clipW - 1) + "…" : cleaned);
   }
 
   // Ensure scroll is valid
@@ -5162,8 +5174,8 @@ function render(state) {
   const rawPanelH = Math.min(MAX_PANEL, Math.max(MIN_PANEL, Math.floor(totalBody * 0.4)));
   const panelHeight = Math.min(rawPanelH, Math.max(3, totalBody - 5)); // ensure list gets at least 5 rows
   const listAreaH = totalBody - panelHeight;
-  // List area = boxTop(1) + ruleUnderline(1) + colHeader(1) + rows + boxBottom(1)
-  const listHeight = Math.max(1, listAreaH - 4);
+  // List area = boxTop(1) + colHeader(1) + rows + boxBottom(1)
+  const listHeight = Math.max(1, listAreaH - 3);
   const now = new Date();
   const list = state.filtered;
 

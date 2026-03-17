@@ -3217,6 +3217,12 @@ function createState() {
     listTab: 0, // 0=Sessions, 1=Live Sessions
     hoverListTab: -1, // list tab hover, -1 = none
     configSubTab: 0, // active sub-tab in Config panel
+    infoScroll: 0, // scroll offset in Info panel content
+    _infoScrollbar: null, // scrollbar geometry for Info panel
+    _infoScrollbarHover: false,
+    _infoScrollbarDrag: false,
+    _infoDragStartRow: 0,
+    _infoDragStartScroll: 0,
     costScroll: 0, // scroll offset in Cost panel content
     _costScrollbar: null, // scrollbar geometry for Cost panel
     _agentScrollbar: null, // scrollbar geometry for Tool Activity panel
@@ -4024,7 +4030,7 @@ function renderBottomPanels(session, data, plan, width, panelHeight, activeTab, 
   // --- Content ---
   let contentLines;
   switch (activeTab) {
-    case 0: contentLines = renderSessionInfoPanel(session, data, plan, width, innerH); break;
+    case 0: contentLines = renderSessionInfoPanel(session, data, plan, width, innerH, state?.infoScroll || 0, state); break;
     case 1: contentLines = renderSystemPanel(session, data, width, innerH); break;
     case 2: contentLines = renderAgentPanel(session, data, width, innerH, state); break;
     case 3: contentLines = renderCostPanel(session, data, plan, width, innerH, state.costScroll, state); break;
@@ -4043,21 +4049,24 @@ function renderBottomPanels(session, data, plan, width, panelHeight, activeTab, 
 }
 
 /** Info panel: session identity, model, project, cost, tokens */
-function renderSessionInfoPanel(session, data, plan, panelW, rows) {
-  const lines = [];
+function renderSessionInfoPanel(session, data, plan, panelW, rows, scrollTop, state) {
+  const allLines = [];
   const w = panelW - 4; // inner content width
   const dimRule = "\x1b[38;5;238m";
 
   if (!session) {
-    lines.push(C.dimText + "No session selected" + RESET);
-    while (lines.length < rows) lines.push("");
-    return lines;
+    allLines.push(C.dimText + "No session selected" + RESET);
+    while (allLines.length < rows) allLines.push("");
+    return allLines;
   }
   if (!data) {
-    lines.push(C.dimText + "Loading..." + RESET);
-    while (lines.length < rows) lines.push("");
-    return lines;
+    allLines.push(C.dimText + "Loading..." + RESET);
+    while (allLines.length < rows) allLines.push("");
+    return allLines;
   }
+
+  // Alias: allLines as lines inside the generation block for readability
+  const lines = allLines;
 
   session._copyTargets = [];
   const prov = session.provider === "claude" ? "Claude" : "Codex";
@@ -4134,7 +4143,7 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows) {
   }
 
   // ── Lines added/removed (Claude only) ──
-  if (session.provider === "claude" && (m.lines_added > 0 || m.lines_removed > 0) && lines.length < rows - 3) {
+  if (session.provider === "claude" && (m.lines_added > 0 || m.lines_removed > 0)) {
     lines.push(dimRule + "─".repeat(Math.min(w, 40)) + RESET);
     const addStr = m.lines_added > 0 ? `${C.hdrLabel}+${RESET}\x1b[38;5;114m${m.lines_added.toLocaleString()}${RESET}` : "";
     const remStr = m.lines_removed > 0 ? `${C.hdrLabel}-${RESET}\x1b[38;5;203m${m.lines_removed.toLocaleString()}${RESET}` : "";
@@ -4144,20 +4153,17 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows) {
 
   // ── Context headroom ──
   const ctx = session.list_context;
-  if (ctx && lines.length < rows - 3) {
+  if (ctx) {
     lines.push(dimRule + "─".repeat(Math.min(w, 40)) + RESET);
 
     if (ctx.compacting) {
-      // Flashing "Compacting..." indicator
       const flash = Math.floor(Date.now() / 600) % 2 === 0;
       const compactColor = flash ? "\x1b[1;31m" : "\x1b[38;5;52m";
       lines.push(`${C.hdrLabel}Compaction${RESET} ${compactColor}compacting...${RESET}`);
-      if (lines.length < rows - 1) {
-        const barW = Math.min(w - 2, 40);
-        let bar = "";
-        for (let b = 0; b < barW; b++) bar += compactColor + "━" + RESET;
-        lines.push(`           ${bar}`);
-      }
+      const barW = Math.min(w - 2, 40);
+      let bar = "";
+      for (let b = 0; b < barW; b++) bar += compactColor + "━" + RESET;
+      lines.push(`           ${bar}`);
     } else {
       const compactAt = Math.round(ctx.max * COMPACT_THRESHOLD);
       const headroom = Math.max(0, compactAt - ctx.used);
@@ -4167,27 +4173,105 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows) {
       const usedStr = compactTokens(ctx.used);
       const limitStr = compactTokens(compactAt);
       lines.push(`${C.hdrLabel}Compaction${RESET} ${pctColor}${String(usedPct).padStart(3)}%${RESET}  ${C.hdrLabel}used${RESET} ${C.hdrValue}${usedStr}${RESET} ${C.hdrLabel}of${RESET} ${C.hdrValue}${limitStr}${RESET} ${C.hdrLabel}tokens${RESET}`);
-
-      // Usage bar (filled = used portion relative to compaction threshold)
-      if (lines.length < rows - 1) {
-        const barW = Math.min(w - 2, 40);
-        const usedRatio = Math.min(1, ctx.used / compactAt);
-        const filled = Math.round(usedRatio * barW);
-        let bar = "";
-        for (let b = 0; b < barW; b++) {
-          if (b < filled) {
-            bar += pctColor + "━" + RESET;
-          } else {
-            bar += "\x1b[38;5;244m" + "─" + RESET;
-          }
-        }
-        lines.push(`           ${bar}`);
+      const barW = Math.min(w - 2, 40);
+      const usedRatio = Math.min(1, ctx.used / compactAt);
+      const filled = Math.round(usedRatio * barW);
+      let bar = "";
+      for (let b = 0; b < barW; b++) {
+        bar += (b < filled ? pctColor + "━" : "\x1b[38;5;244m─") + RESET;
       }
+      lines.push(`           ${bar}`);
     }
   }
 
-  while (lines.length < rows) lines.push("");
-  return lines.slice(0, rows);
+  // ── Token summary ──
+  if (data.tokens) {
+    const t = data.tokens;
+    lines.push(dimRule + "─".repeat(Math.min(w, 40)) + RESET);
+    lines.push(`${C.hdrLabel}Tokens${RESET}`);
+    if (t.input)         lines.push(`  ${C.hdrLabel}Input${RESET}        ${C.hdrValue}${compactTokens(t.input)}${RESET}`);
+    if (t.cache_write_5m) lines.push(`  ${C.hdrLabel}Cache write 5m${RESET} ${C.hdrValue}${compactTokens(t.cache_write_5m)}${RESET}`);
+    if (t.cache_write_1h) lines.push(`  ${C.hdrLabel}Cache write 1h${RESET} ${C.hdrValue}${compactTokens(t.cache_write_1h)}${RESET}`);
+    if (t.cache_read)    lines.push(`  ${C.hdrLabel}Cache read${RESET}    ${C.hdrValue}${compactTokens(t.cache_read)}${RESET}`);
+    if (t.output)        lines.push(`  ${C.hdrLabel}Output${RESET}        ${C.hdrValue}${compactTokens(t.output)}${RESET}`);
+    if (t.total)         lines.push(`  ${C.hdrLabel}Total${RESET}         ${C.hdrValue}${compactTokens(t.total)}${RESET}`);
+  }
+
+  // ── Cost summary ──
+  if (data.costs) {
+    const c = data.costs;
+    const incl = planIncludesProvider(plan, session.provider);
+    lines.push(dimRule + "─".repeat(Math.min(w, 40)) + RESET);
+    lines.push(`${C.hdrLabel}Cost${RESET}`);
+    if (incl) {
+      lines.push(`  ${C.hdrLabel}Total${RESET}    ${C.dimText}included${RESET}`);
+    } else {
+      const tot = parseFloat(c.total || 0);
+      lines.push(`  ${C.hdrLabel}Total${RESET}    ${costColor(tot)}$${tot.toFixed(4)}${RESET}`);
+      if (c.input)         lines.push(`  ${C.hdrLabel}Input${RESET}    ${C.hdrValue}$${parseFloat(c.input).toFixed(4)}${RESET}`);
+      if (c.cache_read)    lines.push(`  ${C.hdrLabel}Cache rd${RESET} ${C.hdrValue}$${parseFloat(c.cache_read).toFixed(4)}${RESET}`);
+      if (c.cache_write_5m) lines.push(`  ${C.hdrLabel}Cache wr${RESET} ${C.hdrValue}$${parseFloat(c.cache_write_5m).toFixed(4)}${RESET}`);
+      if (c.output)        lines.push(`  ${C.hdrLabel}Output${RESET}   ${C.hdrValue}$${parseFloat(c.output).toFixed(4)}${RESET}`);
+    }
+  }
+
+  // ── Activity summary ──
+  if (m.tool_count > 0 || m.skill_count > 0 || m.web_fetch_count > 0 || m.mcp_tool_count > 0) {
+    lines.push(dimRule + "─".repeat(Math.min(w, 40)) + RESET);
+    lines.push(`${C.hdrLabel}Activity${RESET}`);
+    if (m.tool_count > 0) {
+      lines.push(`  ${C.hdrLabel}Tools${RESET}  ${C.hdrValue}${m.tool_count.toLocaleString()}${RESET} total`);
+      const topTools = Object.entries(m.tools).sort((a, b) => b[1] - a[1]).slice(0, 8);
+      for (const [name, cnt] of topTools) {
+        lines.push(`    ${C.dimText}${cnt.toLocaleString()}×${RESET} ${C.hdrValue}${name}${RESET}`);
+      }
+    }
+    if (m.skill_count > 0) {
+      lines.push(`  ${C.hdrLabel}Skills${RESET} ${C.hdrValue}${m.skill_count.toLocaleString()}${RESET} total`);
+      const topSkills = Object.entries(m.skills).sort((a, b) => b[1] - a[1]).slice(0, 5);
+      for (const [name, cnt] of topSkills) {
+        lines.push(`    ${C.dimText}${cnt}×${RESET} ${C.hdrValue}/${name}${RESET}`);
+      }
+    }
+    if (m.web_fetch_count > 0 || m.web_search_count > 0) {
+      lines.push(`  ${C.hdrLabel}Web${RESET}    ${C.hdrValue}${m.web_fetch_count}${RESET} fetches  ${C.hdrValue}${m.web_search_count}${RESET} searches`);
+    }
+    if (m.mcp_tool_count > 0) {
+      lines.push(`  ${C.hdrLabel}MCP${RESET}    ${C.hdrValue}${m.mcp_tool_count}${RESET} calls`);
+    }
+  }
+
+  // Clamp and apply scroll
+  const maxScroll = Math.max(0, allLines.length - rows);
+  const scroll = Math.min(scrollTop || 0, maxScroll);
+  if (state) state.infoScroll = scroll;
+
+  // Scrollbar geometry
+  const hasScrollbar = allLines.length > rows;
+  if (hasScrollbar && state) {
+    const thumbSize = Math.max(1, Math.round((rows / allLines.length) * rows));
+    const thumbStart = maxScroll > 0 ? Math.round((scroll / maxScroll) * (rows - thumbSize)) : 0;
+    const thumbEnd = thumbStart + thumbSize;
+    state._infoScrollbar = { col: panelW - 3, thumbStart, thumbEnd, thumbSize, rows, maxScroll, totalLines: allLines.length };
+  } else if (state) {
+    state._infoScrollbar = null;
+  }
+
+  const visible = allLines.slice(scroll, scroll + rows);
+  while (visible.length < rows) visible.push("");
+
+  if (!hasScrollbar || !state) return visible;
+
+  const contentW = panelW - 5;
+  return visible.map((line, r) => {
+    const isThumb = r >= (state._infoScrollbar?.thumbStart || 0) && r < (state._infoScrollbar?.thumbEnd || 0);
+    const padded = ansiSlice(line, 0, contentW);
+    if (isThumb) {
+      const color = (state._infoScrollbarHover || state._infoScrollbarDrag) ? "\x1b[1;38;5;255m" : "\x1b[38;5;245m";
+      return padded + color + "┃" + RESET;
+    }
+    return padded + "\x1b[38;5;238m│" + RESET;
+  });
 }
 
 /** Cost panel: /cost-style breakdown — total, API duration, wall time, lines, per-model */
@@ -5879,7 +5963,9 @@ function handleEvent(event, state) {
       return;
     }
     case "scroll_up":
-      if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
+      if (state.bottomTab === 0 && state._configPanelTop && event.row >= state._configPanelTop) {
+        if (state.infoScroll > 0) { state.infoScroll--; state.dirty = true; }
+      } else if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
         if (state.costScroll > 0) { state.costScroll--; state.dirty = true; }
       } else if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
         if (state.configScroll > 0) { state.configScroll--; state.dirty = true; }
@@ -5896,7 +5982,9 @@ function handleEvent(event, state) {
       }
       return;
     case "scroll_down":
-      if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
+      if (state.bottomTab === 0 && state._configPanelTop && event.row >= state._configPanelTop) {
+        state.infoScroll++; state.dirty = true; // clamped in render
+      } else if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
         state.costScroll++; state.dirty = true; // clamped in render
       } else if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
         state.configScroll++; state.dirty = true; // clamped in render
@@ -6057,6 +6145,26 @@ function handleEvent(event, state) {
         }
         return; // consume clicks in agent panel area
       }
+      // Check if click is in Info panel scrollbar
+      if (state.bottomTab === 0 && state._configPanelTop && event.row >= state._configPanelTop) {
+        const rowInPanel = event.row - state._configPanelTop;
+        const sb = state._infoScrollbar;
+        if (sb && event.col === sb.col) {
+          if (rowInPanel >= sb.thumbStart && rowInPanel < sb.thumbEnd) {
+            state._infoScrollbarDrag = true;
+            state._infoDragStartRow = rowInPanel;
+            state._infoDragStartScroll = state.infoScroll;
+            state.dirty = true;
+          } else if (rowInPanel < sb.thumbStart) {
+            state.infoScroll = Math.max(0, state.infoScroll - sb.rows);
+            state.dirty = true;
+          } else {
+            state.infoScroll = Math.min(sb.maxScroll, state.infoScroll + sb.rows);
+            state.dirty = true;
+          }
+          return;
+        }
+      }
       // Check if click is in Cost panel scrollbar
       if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
@@ -6160,6 +6268,17 @@ function handleEvent(event, state) {
       // Track hover over config sub-tabs and scrollbar
       let newConfigHover = -1;
       let newScrollHover = false;
+      if (state.bottomTab === 0 && state._configPanelTop) {
+        const rowInPanel = event.row - state._configPanelTop;
+        const sb = state._infoScrollbar;
+        if (sb && event.col === sb.col && rowInPanel >= sb.thumbStart && rowInPanel < sb.thumbEnd) {
+          newScrollHover = true;
+        }
+        if (newScrollHover !== state._infoScrollbarHover) {
+          state._infoScrollbarHover = newScrollHover;
+          state.dirty = true;
+        }
+      }
       if (state.bottomTab === 3 && state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
         const sb = state._costScrollbar;
@@ -6235,6 +6354,17 @@ function handleEvent(event, state) {
     }
 
     case "drag": {
+      if (state._infoScrollbarDrag && state._infoScrollbar && state._configPanelTop) {
+        const sb = state._infoScrollbar;
+        const rowInPanel = event.row - state._configPanelTop;
+        const delta = rowInPanel - state._infoDragStartRow;
+        const track = sb.rows - sb.thumbSize;
+        if (track > 0) {
+          const scrollDelta = Math.round((delta / track) * sb.maxScroll);
+          state.infoScroll = Math.max(0, Math.min(sb.maxScroll, state._infoDragStartScroll + scrollDelta));
+          state.dirty = true;
+        }
+      }
       if (state._costScrollbarDrag && state._costScrollbar && state._configPanelTop) {
         const sb = state._costScrollbar;
         const rowInPanel = event.row - state._configPanelTop;
@@ -6262,6 +6392,10 @@ function handleEvent(event, state) {
     }
 
     case "mouseup": {
+      if (state._infoScrollbarDrag) {
+        state._infoScrollbarDrag = false;
+        state.dirty = true;
+      }
       if (state._costScrollbarDrag) {
         state._costScrollbarDrag = false;
         state.dirty = true;
@@ -6745,6 +6879,7 @@ async function main() {
     if (panelSel && panelSel.session_id !== state._panelSessionId) {
       state._panelSessionId = panelSel.session_id;
       state.panelData = null; // show "Loading..." immediately
+      state.infoScroll = 0;
       state.costScroll = 0;
       state.configScroll = 0;
       state.configSubTab = 0;

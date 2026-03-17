@@ -2206,7 +2206,7 @@ const SPARK_STYLES = {
 // History buffers for CPU/memory (keyed by session)
 const _cpuHistory = new Map();   // sessionKey → number[]
 const _memHistory = new Map();   // sessionKey → number[]
-const HISTORY_MAX = 60;
+const HISTORY_MAX = 300;
 
 function pushHistory(map, key, value) {
   if (!map.has(key)) map.set(key, []);
@@ -2392,7 +2392,7 @@ function renderBrailleChart(values, totalWidth, chartRows, maxVal, colorMode, fo
 
   const start = Math.max(0, values.length - dotW);
   const vis = values.slice(start);
-  const off = dotW - vis.length;
+  const off = 0; // left-align: data grows left→right; blank is on right while filling
 
   function dot(x, y) {
     if (x < 0 || x >= dotW || y < 0 || y >= dotH) return;

@@ -4184,63 +4184,6 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows, scrollTop, st
     }
   }
 
-  // ── Token summary ──
-  if (data.tokens) {
-    const t = data.tokens;
-    lines.push(dimRule + "─".repeat(Math.min(w, 40)) + RESET);
-    lines.push(`${C.hdrLabel}Tokens${RESET}`);
-    if (t.input)         lines.push(`  ${C.hdrLabel}Input${RESET}        ${C.hdrValue}${compactTokens(t.input)}${RESET}`);
-    if (t.cache_write_5m) lines.push(`  ${C.hdrLabel}Cache write 5m${RESET} ${C.hdrValue}${compactTokens(t.cache_write_5m)}${RESET}`);
-    if (t.cache_write_1h) lines.push(`  ${C.hdrLabel}Cache write 1h${RESET} ${C.hdrValue}${compactTokens(t.cache_write_1h)}${RESET}`);
-    if (t.cache_read)    lines.push(`  ${C.hdrLabel}Cache read${RESET}    ${C.hdrValue}${compactTokens(t.cache_read)}${RESET}`);
-    if (t.output)        lines.push(`  ${C.hdrLabel}Output${RESET}        ${C.hdrValue}${compactTokens(t.output)}${RESET}`);
-    if (t.total)         lines.push(`  ${C.hdrLabel}Total${RESET}         ${C.hdrValue}${compactTokens(t.total)}${RESET}`);
-  }
-
-  // ── Cost summary ──
-  if (data.costs) {
-    const c = data.costs;
-    const incl = planIncludesProvider(plan, session.provider);
-    lines.push(dimRule + "─".repeat(Math.min(w, 40)) + RESET);
-    lines.push(`${C.hdrLabel}Cost${RESET}`);
-    if (incl) {
-      lines.push(`  ${C.hdrLabel}Total${RESET}    ${C.dimText}included${RESET}`);
-    } else {
-      const tot = parseFloat(c.total || 0);
-      lines.push(`  ${C.hdrLabel}Total${RESET}    ${costColor(tot)}$${tot.toFixed(4)}${RESET}`);
-      if (c.input)         lines.push(`  ${C.hdrLabel}Input${RESET}    ${C.hdrValue}$${parseFloat(c.input).toFixed(4)}${RESET}`);
-      if (c.cache_read)    lines.push(`  ${C.hdrLabel}Cache rd${RESET} ${C.hdrValue}$${parseFloat(c.cache_read).toFixed(4)}${RESET}`);
-      if (c.cache_write_5m) lines.push(`  ${C.hdrLabel}Cache wr${RESET} ${C.hdrValue}$${parseFloat(c.cache_write_5m).toFixed(4)}${RESET}`);
-      if (c.output)        lines.push(`  ${C.hdrLabel}Output${RESET}   ${C.hdrValue}$${parseFloat(c.output).toFixed(4)}${RESET}`);
-    }
-  }
-
-  // ── Activity summary ──
-  if (m.tool_count > 0 || m.skill_count > 0 || m.web_fetch_count > 0 || m.mcp_tool_count > 0) {
-    lines.push(dimRule + "─".repeat(Math.min(w, 40)) + RESET);
-    lines.push(`${C.hdrLabel}Activity${RESET}`);
-    if (m.tool_count > 0) {
-      lines.push(`  ${C.hdrLabel}Tools${RESET}  ${C.hdrValue}${m.tool_count.toLocaleString()}${RESET} total`);
-      const topTools = Object.entries(m.tools).sort((a, b) => b[1] - a[1]).slice(0, 8);
-      for (const [name, cnt] of topTools) {
-        lines.push(`    ${C.dimText}${cnt.toLocaleString()}×${RESET} ${C.hdrValue}${name}${RESET}`);
-      }
-    }
-    if (m.skill_count > 0) {
-      lines.push(`  ${C.hdrLabel}Skills${RESET} ${C.hdrValue}${m.skill_count.toLocaleString()}${RESET} total`);
-      const topSkills = Object.entries(m.skills).sort((a, b) => b[1] - a[1]).slice(0, 5);
-      for (const [name, cnt] of topSkills) {
-        lines.push(`    ${C.dimText}${cnt}×${RESET} ${C.hdrValue}/${name}${RESET}`);
-      }
-    }
-    if (m.web_fetch_count > 0 || m.web_search_count > 0) {
-      lines.push(`  ${C.hdrLabel}Web${RESET}    ${C.hdrValue}${m.web_fetch_count}${RESET} fetches  ${C.hdrValue}${m.web_search_count}${RESET} searches`);
-    }
-    if (m.mcp_tool_count > 0) {
-      lines.push(`  ${C.hdrLabel}MCP${RESET}    ${C.hdrValue}${m.mcp_tool_count}${RESET} calls`);
-    }
-  }
-
   // Clamp and apply scroll
   const maxScroll = Math.max(0, allLines.length - rows);
   const scroll = Math.min(scrollTop || 0, maxScroll);

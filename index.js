@@ -2521,8 +2521,15 @@ const COL_TOOLS_RATE = {
   compare: (a, b) => (a.list_tools_since_start || 0) - (b.list_tools_since_start || 0),
 };
 const COL_MODEL = {
-  key: "model", label: "MODEL", width: 14, align: "left", desc: "AI model used by the session",
-  render: (s) => (s.model || "").replace(/^claude-/, "").replace(/^gpt-/, ""),
+  key: "model", label: "MODEL", width: 16, align: "left", desc: "AI model used by the session",
+  render: (s) => {
+    const m = s.model || "";
+    const ml = m.toLowerCase();
+    const icon = ml.startsWith("claude") ? "✦ "
+      : (ml.startsWith("gpt") || ml.startsWith("o1") || ml.startsWith("o3") || ml.startsWith("o4")) ? "◆ "
+      : "";
+    return icon + m.replace(/^claude-/, "").replace(/^gpt-/, "");
+  },
   compare: (a, b) => (a.model || "").localeCompare(b.model || ""),
 };
 const COL_IN_TOKENS = {

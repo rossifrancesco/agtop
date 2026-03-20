@@ -234,9 +234,9 @@ OPTIONS
 KEYBOARD SHORTCUTS (interactive mode)
   j/k, arrows            Navigate sessions
   Enter                  Open detail view
-  Tab                    Cycle bottom panel tabs (Info/Performance/Tool/Cost/Config/Processes)
+  Tab                    Cycle bottom panel tabs (Info/Performance/Processes/Tool/Cost/Config)
   \`                      Toggle Sessions/Live Sessions list view
-  1-6                    Jump to Info/Performance/Tool Activity/Cost/Config/Processes panel
+  1-6                    Jump to Info/Performance/Processes/Tool Activity/Cost/Config panel
   F3 or /                Filter sessions by text
   F6 or >                Sort-by panel
   F7                     Filter sessions by age (1d / 1w / 1mo)
@@ -3223,7 +3223,7 @@ function createState() {
     headerLines: 4, // number of header lines (boxTop + 2 content + boxBottom)
     _processMetrics: new Map(),
     _tier2Tick: TIER2_INTERVAL_TICKS - 1,
-    bottomTab: 0, // 0=Info, 1=Cost, 2=Performance, 3=Tool Activity, 4=Config
+    bottomTab: 0, // 0=Info, 1=Performance, 2=Processes, 3=Tool Activity, 4=Cost, 5=Config
     hoverTab: -1, // tab index being hovered, -1 = none
     listTab: 0, // 0=Sessions, 1=Live Sessions
     hoverListTab: -1, // list tab hover, -1 = none
@@ -3988,7 +3988,7 @@ const MAX_PANEL = 30;
  * Build content lines for each of the three bottom panels, then merge
  * them side-by-side with box borders into composite screen lines.
  */
-const BOTTOM_TABS = ["Info", "Performance", "Tool Activity", "Cost", "Config", "Processes"];
+const BOTTOM_TABS = ["Info", "Performance", "Processes", "Tool Activity", "Cost", "Config"];
 
 function renderBottomPanels(session, data, plan, width, panelHeight, activeTab, hoverTab, state) {
   const bc = C.border;
@@ -4047,10 +4047,10 @@ function renderBottomPanels(session, data, plan, width, panelHeight, activeTab, 
   switch (activeTab) {
     case 0: contentLines = renderSessionInfoPanel(session, data, plan, width, innerH, state?.infoScroll || 0, state); break;
     case 1: contentLines = renderSystemPanel(session, data, width, innerH); break;
-    case 2: contentLines = renderAgentPanel(session, data, width, innerH, state); break;
-    case 3: contentLines = renderCostPanel(session, data, plan, width, innerH, state.costScroll, state); break;
-    case 4: contentLines = renderConfigPanel(session, width, innerH, state); break;
-    case 5: contentLines = renderProcessesPanel(session, width, innerH, state); break;
+    case 2: contentLines = renderProcessesPanel(session, width, innerH, state); break;
+    case 3: contentLines = renderAgentPanel(session, data, width, innerH, state); break;
+    case 4: contentLines = renderCostPanel(session, data, plan, width, innerH, state.costScroll, state); break;
+    case 5: contentLines = renderConfigPanel(session, width, innerH, state); break;
     default: contentLines = renderSessionInfoPanel(session, data, plan, width, innerH);
   }
 
@@ -4969,7 +4969,7 @@ function renderHelpView(width, height) {
   lines.push("");
   lines.push(BOLD + "  Tabs:" + RESET);
   lines.push("    Tab              Cycle bottom panel tabs");
-  lines.push("    1, 2, 3, 4, 5    Switch to Info/Cost/Performance/Tools/Config");
+  lines.push("    1-6              Switch to Info/Performance/Processes/Tool Activity/Cost/Config");
   lines.push("    Shift+Tab / `    Toggle Live filter (show only running sessions)");
   lines.push("");
   lines.push(BOLD + "  Other:" + RESET);
@@ -6083,13 +6083,13 @@ function handleEvent(event, state) {
     case "scroll_up":
       if (state.bottomTab === 0 && state._configPanelTop && event.row >= state._configPanelTop) {
         if (state.infoScroll > 0) { state.infoScroll--; state.dirty = true; }
-      } else if (state.bottomTab === 5 && state._configPanelTop && event.row >= state._configPanelTop) {
-        if (state.procScroll > 0) { state.procScroll--; state.dirty = true; }
-      } else if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
-        if (state.costScroll > 0) { state.costScroll--; state.dirty = true; }
-      } else if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
-        if (state.configScroll > 0) { state.configScroll--; state.dirty = true; }
       } else if (state.bottomTab === 2 && state._configPanelTop && event.row >= state._configPanelTop) {
+        if (state.procScroll > 0) { state.procScroll--; state.dirty = true; }
+      } else if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
+        if (state.costScroll > 0) { state.costScroll--; state.dirty = true; }
+      } else if (state.bottomTab === 5 && state._configPanelTop && event.row >= state._configPanelTop) {
+        if (state.configScroll > 0) { state.configScroll--; state.dirty = true; }
+      } else if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
         const hoverCol = event.col - 2;
         if (hoverCol >= 0 && hoverCol <= (state._agentTabWidth || 14)) {
           // Scroll sidebar
@@ -6104,13 +6104,13 @@ function handleEvent(event, state) {
     case "scroll_down":
       if (state.bottomTab === 0 && state._configPanelTop && event.row >= state._configPanelTop) {
         state.infoScroll++; state.dirty = true; // clamped in render
-      } else if (state.bottomTab === 5 && state._configPanelTop && event.row >= state._configPanelTop) {
-        state.procScroll++; state.dirty = true; // clamped in render
-      } else if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
-        state.costScroll++; state.dirty = true; // clamped in render
-      } else if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
-        state.configScroll++; state.dirty = true; // clamped in render
       } else if (state.bottomTab === 2 && state._configPanelTop && event.row >= state._configPanelTop) {
+        state.procScroll++; state.dirty = true; // clamped in render
+      } else if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
+        state.costScroll++; state.dirty = true; // clamped in render
+      } else if (state.bottomTab === 5 && state._configPanelTop && event.row >= state._configPanelTop) {
+        state.configScroll++; state.dirty = true; // clamped in render
+      } else if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
         const hoverCol = event.col - 2;
         if (hoverCol >= 0 && hoverCol <= (state._agentTabWidth || 14)) {
           state.agentTabScroll++; state.dirty = true; // clamped in render
@@ -6205,7 +6205,7 @@ function handleEvent(event, state) {
         }
       }
       // Check if click is in Tool Activity panel
-      if (state.bottomTab === 2 && state._configPanelTop && event.row >= state._configPanelTop) {
+      if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
         const clickCol = event.col - 2; // adjust for panel border "│ "
         // Click on vertical tab sidebar
@@ -6268,7 +6268,7 @@ function handleEvent(event, state) {
         return; // consume clicks in agent panel area
       }
       // Check if click is in Processes panel header (sort by column)
-      if (state.bottomTab === 5 && state._configPanelTop && event.row >= state._configPanelTop) {
+      if (state.bottomTab === 2 && state._configPanelTop && event.row >= state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
         if (rowInPanel === 0) { // header row
           const pidW = 7, cpuW = 6, memW = 8;
@@ -6311,7 +6311,7 @@ function handleEvent(event, state) {
         }
       }
       // Check if click is in Cost panel scrollbar
-      if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
+      if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
         const sb = state._costScrollbar;
         if (sb && event.col === sb.col) {
@@ -6331,7 +6331,7 @@ function handleEvent(event, state) {
         }
       }
       // Check if click is in Config panel area
-      if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
+      if (state.bottomTab === 5 && state._configPanelTop && event.row >= state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
         const selected = state.filtered[state.selectedRow];
         const sections = getSessionConfig(selected);
@@ -6424,7 +6424,7 @@ function handleEvent(event, state) {
           state.dirty = true;
         }
       }
-      if (state.bottomTab === 3 && state._configPanelTop) {
+      if (state.bottomTab === 4 && state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
         const sb = state._costScrollbar;
         if (sb && event.col === sb.col && rowInPanel >= sb.thumbStart && rowInPanel < sb.thumbEnd) {
@@ -6435,7 +6435,7 @@ function handleEvent(event, state) {
           state.dirty = true;
         }
       }
-      if (state.bottomTab === 4 && state._configPanelTop) {
+      if (state.bottomTab === 5 && state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
         const selected = state.filtered[state.selectedRow];
         const sections = getSessionConfig(selected);
@@ -6450,7 +6450,7 @@ function handleEvent(event, state) {
       // Track hover over agent tool tabs and arrows (vertical sidebar)
       let newAgentToolHover = -1;
       let newAgentArrowHover = "";
-      if (state.bottomTab === 2 && state._configPanelTop) {
+      if (state.bottomTab === 3 && state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
         const hoverCol = event.col - 2;
         if (hoverCol >= 0 && hoverCol <= (state._agentTabWidth || 14)) {

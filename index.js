@@ -4117,7 +4117,7 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows, scrollTop, st
   lines.push(`${C.hdrLabel}Type${RESET}       ${provColor}${prov}${RESET}  ${C.hdrLabel}Model${RESET} ${mdlColor}${displayModel}${RESET}`);
   addCopyLine("ID", shortSid, sid, "id", 9);
   {
-    const fullCmd = (pm && pm.command) || (session.provider === "claude" ? `claude --resume ${sid}` : `codex --resume ${sid}`);
+    const fullCmd = (pm && pm.command) || (session.provider === "claude" ? `claude --resume ${sid}` : `codex resume ${sid}`);
     const maxCmdW = w - 12;
     const cmd = fullCmd.length > maxCmdW ? fullCmd.slice(0, maxCmdW - 3) + "..." : fullCmd;
     addCopyLine("Cmd", cmd, fullCmd, "cmd", 9);

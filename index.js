@@ -5044,6 +5044,38 @@ function renderDeleteConfirm(session, width) {
 }
 
 // ---------------------------------------------------------------------------
+// Render: can't-delete-live-session modal
+// ---------------------------------------------------------------------------
+
+function renderDeleteLiveBlocked(session, width) {
+  const modalW = Math.min(60, width - 6);
+  const boxLeft = Math.floor((width - modalW) / 2);
+  const border = "\x1b[38;5;214;48;5;58m"; // amber on dark-yellow
+  const labelC = "\x1b[1;38;5;221;48;5;58m";
+  const bodyC  = "\x1b[38;5;252;48;5;58m";
+  const hintC  = "\x1b[38;5;245;48;5;58m";
+  const inner  = modalW - 2;
+
+  const pad = (s) => {
+    const plain = s.replace(/\x1b\[[^m]*m/g, "");
+    return s + " ".repeat(Math.max(0, inner - plain.length));
+  };
+
+  const name = (session.list_label || session.label || session.session_id || "").slice(0, inner - 4);
+  const topLine   = border + "╭" + "─".repeat(inner) + "╮" + RESET;
+  const titleLine = border + "│" + RESET + labelC + pad("  Session is running") + RESET + border + "│" + RESET;
+  const sepLine   = border + "├" + "─".repeat(inner) + "┤" + RESET;
+  const nameLine  = border + "│" + RESET + bodyC + pad("  " + name) + RESET + border + "│" + RESET;
+  const emptyLine = border + "│" + " ".repeat(inner) + "│" + RESET;
+  const bodyLine  = border + "│" + RESET + bodyC + pad("  Cannot delete a session that is currently running.") + RESET + border + "│" + RESET;
+  const body2Line = border + "│" + RESET + bodyC + pad("  Stop the agent first, then delete.") + RESET + border + "│" + RESET;
+  const hintLine  = border + "│" + RESET + hintC + pad("  [Esc / any key] dismiss") + RESET + border + "│" + RESET;
+  const botLine   = border + "╰" + "─".repeat(inner) + "╯" + RESET;
+
+  return { lines: [topLine, titleLine, sepLine, nameLine, emptyLine, bodyLine, body2Line, emptyLine, hintLine, botLine], boxLeft, modalW };
+}
+
+// ---------------------------------------------------------------------------
 // Render: sort-by sidebar (htop-style)
 // ---------------------------------------------------------------------------
 
@@ -5374,6 +5406,29 @@ function render(state) {
     const sel = state.filtered[state.selectedRow];
     if (sel) {
       const dm = renderDeleteConfirm(sel, width);
+      const startRow = Math.max(0, Math.floor((screenLines.length - dm.lines.length) / 2));
+      for (let r = 0; r < screenLines.length; r++) {
+        const relRow = r - startRow;
+        if (relRow >= 0 && relRow < dm.lines.length) {
+          const overlay = dm.lines[relRow];
+          const bgLine = screenLines[r] || "";
+          const bgPlain = bgLine.replace(/\x1b\[[^m]*m/g, "");
+          const left = ansiSlice(bgLine, 0, dm.boxLeft);
+          const rightStart = dm.boxLeft + dm.modalW;
+          const right = rightStart < bgPlain.length
+            ? ansiSlice(bgLine, rightStart, width - rightStart)
+            : " ".repeat(Math.max(0, width - rightStart));
+          screenLines[r] = left + overlay + right + RESET;
+        }
+      }
+    }
+  }
+
+  // Overlay delete-blocked modal (live session)
+  if (state.mode === "delete_live") {
+    const sel = state.filtered[state.selectedRow];
+    if (sel) {
+      const dm = renderDeleteLiveBlocked(sel, width);
       const startRow = Math.max(0, Math.floor((screenLines.length - dm.lines.length) / 2));
       for (let r = 0; r < screenLines.length; r++) {
         const relRow = r - startRow;
@@ -5776,6 +5831,11 @@ function handleEvent(event, state) {
     return;
   }
 
+  // --- Delete blocked (live session) modal ---
+  if (state.mode === "delete_live") {
+    state.mode = "list"; state.dirty = true; return;
+  }
+
   // --- Delete confirm mode ---
   if (state.mode === "delete") {
     if (event.type === "ctrl_c" || event.type === "f10") { state.quit = true; return; }
@@ -5827,7 +5887,8 @@ function handleEvent(event, state) {
         case "r": state._needsRefresh = true; return;
         case "d": {
           const sel = state.filtered[state.selectedRow];
-          if (sel && !sel.process) { state.mode = "delete"; state.dirty = true; }
+          if (sel && sel.process) { state.mode = "delete_live"; state.dirty = true; }
+          else if (sel) { state.mode = "delete"; state.dirty = true; }
           return;
         }
         case "P": setSortColumn(state, "status"); return;

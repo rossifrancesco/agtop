@@ -2838,8 +2838,11 @@ function bfsDescendants(rootPid, childrenByPpid) {
 
 // Extract session UUID from Claude/Codex command line args.
 const RESUME_UUID_RE = /\bresume\s+([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})/;
-const CLAUDE_CMD_RE = /\bclaude\b/;
-const CODEX_CMD_RE = /\bcodex\b/;
+// Match "claude" / "codex" as a command (binary name), not as part of a path
+// like ~/.claude/projects/... — require start-of-string or "/" before, whitespace
+// or end-of-string after, so ".claude/" in a path does NOT match.
+const CLAUDE_CMD_RE = /(^|\/)claude(\s|$)/;
+const CODEX_CMD_RE = /(^|\/)codex(\s|$)/;
 const DAEMON_RE = /\b(app-server|server|daemon)\b/;
 
 // lsof-based fallback: find session UUID by checking open files.

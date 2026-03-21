@@ -234,9 +234,9 @@ OPTIONS
 KEYBOARD SHORTCUTS (interactive mode)
   j/k, arrows            Navigate sessions
   Enter                  Open detail view
-  Tab                    Cycle bottom panel tabs (Info/Cost/System/Tool/Config)
+  Tab                    Cycle bottom panel tabs (Info/Performance/Processes/Tool/Cost/Config)
   \`                      Toggle Sessions/Live Sessions list view
-  1/2/3/4/5              Jump to Info/Cost/System/Tool Activity/Config panel
+  1-6                    Jump to Info/Performance/Processes/Tool Activity/Cost/Config panel
   F3 or /                Filter sessions by text
   F6 or >                Sort-by panel
   F7                     Filter sessions by age (1d / 1w / 1mo)
@@ -781,9 +781,12 @@ function extractToolDetail(name, input) {
   else if (name === "TaskUpdate") s = input.task_id ? `#${input.task_id} ${input.status || ""}`.trim() : "";
   else if (name === "TaskGet" || name === "TaskStop" || name === "TaskOutput") s = input.task_id ? `#${input.task_id}` : "";
   else if (name === "TaskList") s = "(list)";
-  else if (typeof input === "object") {
+  else if (name === "write_stdin") {
+    const raw = input.input || input.stdin || "";
+    s = raw.split(/[\r\n]/)[0].slice(0, 200);
+  } else if (typeof input === "object") {
     for (const v of Object.values(input)) {
-      if (typeof v === "string" && v.length > 0) { s = v.slice(0, 120); break; }
+      if (typeof v === "string" && v.length > 0) { s = v.split(/[\r\n]/)[0].slice(0, 120); break; }
     }
   }
   return { short: s, full: s };
@@ -2206,7 +2209,7 @@ const SPARK_STYLES = {
 // History buffers for CPU/memory (keyed by session)
 const _cpuHistory = new Map();   // sessionKey → number[]
 const _memHistory = new Map();   // sessionKey → number[]
-const HISTORY_MAX = 60;
+const HISTORY_MAX = 300;
 
 function pushHistory(map, key, value) {
   if (!map.has(key)) map.set(key, []);
@@ -2392,7 +2395,7 @@ function renderBrailleChart(values, totalWidth, chartRows, maxVal, colorMode, fo
 
   const start = Math.max(0, values.length - dotW);
   const vis = values.slice(start);
-  const off = dotW - vis.length;
+  const off = 0; // left-align: data grows left→right; blank is on right while filling
 
   function dot(x, y) {
     if (x < 0 || x >= dotW || y < 0 || y >= dotH) return;
@@ -2753,6 +2756,8 @@ async function fetchQuota() {
 const TIER2_INTERVAL_TICKS = 1; // collect every loadSessions tick
 const LSOF_CHUNK_SIZE = 50;
 const PID_TREE_TTL_MS = 15_000; // cache subtree PIDs for 15s
+const PROC_LINGER_TICKS = 3; // keep exited sub-processes visible for N collection cycles
+const _procGhostCache = new Map(); // sessionKey → Map<pid, { entry, remaining }>
 
 // Minimal pidusage: runs ps to get CPU% and RSS for a set of PIDs.
 function pidusage(pids) {
@@ -2832,9 +2837,12 @@ function bfsDescendants(rootPid, childrenByPpid) {
 }
 
 // Extract session UUID from Claude/Codex command line args.
-const RESUME_UUID_RE = /--resume\s+([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})/;
-const CLAUDE_CMD_RE = /\bclaude\b/;
-const CODEX_CMD_RE = /\bcodex\b/;
+const RESUME_UUID_RE = /\bresume\s+([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})/;
+// Match "claude" / "codex" as a command (binary name), not as part of a path
+// like ~/.claude/projects/... — require start-of-string or "/" before, whitespace
+// or end-of-string after, so ".claude/" in a path does NOT match.
+const CLAUDE_CMD_RE = /(^|\/)claude(\s|$)/;
+const CODEX_CMD_RE = /(^|\/)codex(\s|$)/;
 const DAEMON_RE = /\b(app-server|server|daemon)\b/;
 
 // lsof-based fallback: find session UUID by checking open files.
@@ -3034,9 +3042,15 @@ async function collectProcessMetricsWindows(sessions) {
   for (const [key, rootPid] of rootPids) {
     const pids = bfsDescendants(rootPid, childrenByPpid);
     let totalCpu = 0, totalMemory = 0;
+    const processList = [];
     for (const pid of pids) {
       const u = snapshot.get(pid);
-      if (u) { totalCpu += u.cpu; totalMemory += u.memory; }
+      const info = snapshot.get(pid);
+      if (u) {
+        totalCpu += u.cpu;
+        totalMemory += u.memory;
+        processList.push({ pid, cpu: u.cpu, memory: u.memory, args: (info && info.args) || "", isRoot: pid === rootPid });
+      }
     }
     const rootInfo = snapshot.get(rootPid);
     result.set(key, {
@@ -3044,6 +3058,7 @@ async function collectProcessMetricsWindows(sessions) {
       cpu: Math.round(totalCpu * 10) / 10,
       memory: totalMemory,
       command: rootInfo ? rootInfo.args : "",
+      processList,
     });
   }
   return result;
@@ -3160,24 +3175,49 @@ async function collectProcessMetrics(sessions) {
   for (const [key, pids] of sessionPids) {
     let totalCpu = 0;
     let totalMemory = 0;
+    const rootPid = rootPids.get(key);
+    const processList = [];
     for (const pid of pids) {
       const u = usage.get(pid);
       if (u) {
         totalCpu += u.cpu;
         totalMemory += u.memory;
+        const info = snapshot.get(pid);
+        processList.push({ pid, cpu: u.cpu, memory: u.memory, args: (info && info.args) || "", isRoot: pid === rootPid });
       }
     }
-    const rootPid = rootPids.get(key);
     const rootInfo = snapshot.get(rootPid);
     result.set(key, {
       pids: pids.size,
       cpu: Math.round(totalCpu * 10) / 10,
       memory: totalMemory,
       command: rootInfo ? rootInfo.args : "",
+      processList,
     });
   }
 
   return result;
+}
+
+// Merge recently-exited processes back into processList for PROC_LINGER_TICKS cycles.
+function applyProcLinger(key, pm) {
+  if (!_procGhostCache.has(key)) _procGhostCache.set(key, new Map());
+  const ghost = _procGhostCache.get(key);
+  const currentPids = new Set(pm.processList.map((p) => p.pid));
+  // Refresh cache for still-alive pids
+  for (const p of pm.processList) {
+    ghost.set(p.pid, { entry: { ...p }, remaining: PROC_LINGER_TICKS });
+  }
+  // Re-inject recently exited pids as ghost entries
+  for (const [pid, cached] of ghost) {
+    if (currentPids.has(pid)) continue;
+    if (cached.remaining > 0) {
+      pm.processList.push({ ...cached.entry, ghost: true, cpu: 0 });
+      cached.remaining--;
+    } else {
+      ghost.delete(pid);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3212,11 +3252,21 @@ function createState() {
     headerLines: 4, // number of header lines (boxTop + 2 content + boxBottom)
     _processMetrics: new Map(),
     _tier2Tick: TIER2_INTERVAL_TICKS - 1,
-    bottomTab: 0, // 0=Info, 1=Cost, 2=System, 3=Tool Activity, 4=Config
+    bottomTab: 0, // 0=Info, 1=Performance, 2=Processes, 3=Tool Activity, 4=Cost, 5=Config
     hoverTab: -1, // tab index being hovered, -1 = none
     listTab: 0, // 0=Sessions, 1=Live Sessions
     hoverListTab: -1, // list tab hover, -1 = none
     configSubTab: 0, // active sub-tab in Config panel
+    procSort: "cpu",    // "pid" | "cpu" | "mem" | "cmd" — Processes panel sort column
+    procSortDesc: true, // sort direction for Processes panel
+    procScroll: 0,      // scroll offset in Processes panel
+    _procHeaderRow: 0,  // 1-based row of the Processes panel header line
+    infoScroll: 0, // scroll offset in Info panel content
+    _infoScrollbar: null, // scrollbar geometry for Info panel
+    _infoScrollbarHover: false,
+    _infoScrollbarDrag: false,
+    _infoDragStartRow: 0,
+    _infoDragStartScroll: 0,
     costScroll: 0, // scroll offset in Cost panel content
     _costScrollbar: null, // scrollbar geometry for Cost panel
     _agentScrollbar: null, // scrollbar geometry for Tool Activity panel
@@ -3967,7 +4017,7 @@ const MAX_PANEL = 30;
  * Build content lines for each of the three bottom panels, then merge
  * them side-by-side with box borders into composite screen lines.
  */
-const BOTTOM_TABS = ["Info", "System", "Tool Activity", "Cost", "Config"];
+const BOTTOM_TABS = ["Info", "Performance", "Processes", "Tool Activity", "Cost", "Config"];
 
 function renderBottomPanels(session, data, plan, width, panelHeight, activeTab, hoverTab, state) {
   const bc = C.border;
@@ -4024,11 +4074,12 @@ function renderBottomPanels(session, data, plan, width, panelHeight, activeTab, 
   // --- Content ---
   let contentLines;
   switch (activeTab) {
-    case 0: contentLines = renderSessionInfoPanel(session, data, plan, width, innerH); break;
+    case 0: contentLines = renderSessionInfoPanel(session, data, plan, width, innerH, state?.infoScroll || 0, state); break;
     case 1: contentLines = renderSystemPanel(session, data, width, innerH); break;
-    case 2: contentLines = renderAgentPanel(session, data, width, innerH, state); break;
-    case 3: contentLines = renderCostPanel(session, data, plan, width, innerH, state.costScroll, state); break;
-    case 4: contentLines = renderConfigPanel(session, width, innerH, state); break;
+    case 2: contentLines = renderProcessesPanel(session, width, innerH, state); break;
+    case 3: contentLines = renderAgentPanel(session, data, width, innerH, state); break;
+    case 4: contentLines = renderCostPanel(session, data, plan, width, innerH, state.costScroll, state); break;
+    case 5: contentLines = renderConfigPanel(session, width, innerH, state); break;
     default: contentLines = renderSessionInfoPanel(session, data, plan, width, innerH);
   }
 
@@ -4043,21 +4094,24 @@ function renderBottomPanels(session, data, plan, width, panelHeight, activeTab, 
 }
 
 /** Info panel: session identity, model, project, cost, tokens */
-function renderSessionInfoPanel(session, data, plan, panelW, rows) {
-  const lines = [];
+function renderSessionInfoPanel(session, data, plan, panelW, rows, scrollTop, state) {
+  const allLines = [];
   const w = panelW - 4; // inner content width
   const dimRule = "\x1b[38;5;238m";
 
   if (!session) {
-    lines.push(C.dimText + "No session selected" + RESET);
-    while (lines.length < rows) lines.push("");
-    return lines;
+    allLines.push(C.dimText + "No session selected" + RESET);
+    while (allLines.length < rows) allLines.push("");
+    return allLines;
   }
   if (!data) {
-    lines.push(C.dimText + "Loading..." + RESET);
-    while (lines.length < rows) lines.push("");
-    return lines;
+    allLines.push(C.dimText + "Loading..." + RESET);
+    while (allLines.length < rows) allLines.push("");
+    return allLines;
   }
+
+  // Alias: allLines as lines inside the generation block for readability
+  const lines = allLines;
 
   session._copyTargets = [];
   const prov = session.provider === "claude" ? "Claude" : "Codex";
@@ -4092,7 +4146,7 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows) {
   lines.push(`${C.hdrLabel}Type${RESET}       ${provColor}${prov}${RESET}  ${C.hdrLabel}Model${RESET} ${mdlColor}${displayModel}${RESET}`);
   addCopyLine("ID", shortSid, sid, "id", 9);
   {
-    const fullCmd = (pm && pm.command) || (session.provider === "claude" ? `claude --resume ${sid}` : `codex --resume ${sid}`);
+    const fullCmd = (pm && pm.command) || (session.provider === "claude" ? `claude --resume ${sid}` : `codex resume ${sid}`);
     const maxCmdW = w - 12;
     const cmd = fullCmd.length > maxCmdW ? fullCmd.slice(0, maxCmdW - 3) + "..." : fullCmd;
     addCopyLine("Cmd", cmd, fullCmd, "cmd", 9);
@@ -4134,7 +4188,7 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows) {
   }
 
   // ── Lines added/removed (Claude only) ──
-  if (session.provider === "claude" && (m.lines_added > 0 || m.lines_removed > 0) && lines.length < rows - 3) {
+  if (session.provider === "claude" && (m.lines_added > 0 || m.lines_removed > 0)) {
     lines.push(dimRule + "─".repeat(Math.min(w, 40)) + RESET);
     const addStr = m.lines_added > 0 ? `${C.hdrLabel}+${RESET}\x1b[38;5;114m${m.lines_added.toLocaleString()}${RESET}` : "";
     const remStr = m.lines_removed > 0 ? `${C.hdrLabel}-${RESET}\x1b[38;5;203m${m.lines_removed.toLocaleString()}${RESET}` : "";
@@ -4144,20 +4198,17 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows) {
 
   // ── Context headroom ──
   const ctx = session.list_context;
-  if (ctx && lines.length < rows - 3) {
+  if (ctx) {
     lines.push(dimRule + "─".repeat(Math.min(w, 40)) + RESET);
 
     if (ctx.compacting) {
-      // Flashing "Compacting..." indicator
       const flash = Math.floor(Date.now() / 600) % 2 === 0;
       const compactColor = flash ? "\x1b[1;31m" : "\x1b[38;5;52m";
       lines.push(`${C.hdrLabel}Compaction${RESET} ${compactColor}compacting...${RESET}`);
-      if (lines.length < rows - 1) {
-        const barW = Math.min(w - 2, 40);
-        let bar = "";
-        for (let b = 0; b < barW; b++) bar += compactColor + "━" + RESET;
-        lines.push(`           ${bar}`);
-      }
+      const barW = Math.min(w - 2, 40);
+      let bar = "";
+      for (let b = 0; b < barW; b++) bar += compactColor + "━" + RESET;
+      lines.push(`           ${bar}`);
     } else {
       const compactAt = Math.round(ctx.max * COMPACT_THRESHOLD);
       const headroom = Math.max(0, compactAt - ctx.used);
@@ -4167,27 +4218,48 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows) {
       const usedStr = compactTokens(ctx.used);
       const limitStr = compactTokens(compactAt);
       lines.push(`${C.hdrLabel}Compaction${RESET} ${pctColor}${String(usedPct).padStart(3)}%${RESET}  ${C.hdrLabel}used${RESET} ${C.hdrValue}${usedStr}${RESET} ${C.hdrLabel}of${RESET} ${C.hdrValue}${limitStr}${RESET} ${C.hdrLabel}tokens${RESET}`);
-
-      // Usage bar (filled = used portion relative to compaction threshold)
-      if (lines.length < rows - 1) {
-        const barW = Math.min(w - 2, 40);
-        const usedRatio = Math.min(1, ctx.used / compactAt);
-        const filled = Math.round(usedRatio * barW);
-        let bar = "";
-        for (let b = 0; b < barW; b++) {
-          if (b < filled) {
-            bar += pctColor + "━" + RESET;
-          } else {
-            bar += "\x1b[38;5;244m" + "─" + RESET;
-          }
-        }
-        lines.push(`           ${bar}`);
+      const barW = Math.min(w - 2, 40);
+      const usedRatio = Math.min(1, ctx.used / compactAt);
+      const filled = Math.round(usedRatio * barW);
+      let bar = "";
+      for (let b = 0; b < barW; b++) {
+        bar += (b < filled ? pctColor + "━" : "\x1b[38;5;244m─") + RESET;
       }
+      lines.push(`           ${bar}`);
     }
   }
 
-  while (lines.length < rows) lines.push("");
-  return lines.slice(0, rows);
+  // Clamp and apply scroll
+  const maxScroll = Math.max(0, allLines.length - rows);
+  const scroll = Math.min(scrollTop || 0, maxScroll);
+  if (state) state.infoScroll = scroll;
+
+  // Scrollbar geometry
+  const hasScrollbar = allLines.length > rows;
+  if (hasScrollbar && state) {
+    const thumbSize = Math.max(1, Math.round((rows / allLines.length) * rows));
+    const thumbStart = maxScroll > 0 ? Math.round((scroll / maxScroll) * (rows - thumbSize)) : 0;
+    const thumbEnd = thumbStart + thumbSize;
+    state._infoScrollbar = { col: panelW - 3, thumbStart, thumbEnd, thumbSize, rows, maxScroll, totalLines: allLines.length };
+  } else if (state) {
+    state._infoScrollbar = null;
+  }
+
+  const visible = allLines.slice(scroll, scroll + rows);
+  while (visible.length < rows) visible.push("");
+
+  if (!hasScrollbar || !state) return visible;
+
+  const contentW = panelW - 5;
+  return visible.map((line, r) => {
+    const isThumb = r >= (state._infoScrollbar?.thumbStart || 0) && r < (state._infoScrollbar?.thumbEnd || 0);
+    const padded = ansiSlice(line, 0, contentW);
+    if (isThumb) {
+      const color = (state._infoScrollbarHover || state._infoScrollbarDrag) ? "\x1b[1;38;5;255m" : "\x1b[38;5;245m";
+      return padded + color + "┃" + RESET;
+    }
+    return padded + "\x1b[38;5;238m│" + RESET;
+  });
 }
 
 /** Cost panel: /cost-style breakdown — total, API duration, wall time, lines, per-model */
@@ -4366,7 +4438,7 @@ function renderSystemPanel(session, data, panelW, rows) {
   const pm = session.process;
 
   if (!pm) {
-    lines.push(C.dimText + "System data is only available for running sessions" + RESET);
+    lines.push(C.dimText + "Performance data is only available for running sessions" + RESET);
     while (lines.length < rows) lines.push("");
     return lines;
   }
@@ -4700,7 +4772,7 @@ function renderAgentPanel(session, data, panelW, rows, state) {
       const rawDetail = typeof entry === "string" ? entry : (entry.d || "");
       const rawTs = typeof entry === "string" ? "" : (entry.ts || "");
 
-      let display = rawDetail;
+      let display = rawDetail.replace(/[\r\n\t]/g, " ").trimEnd();
       if (HOME && display.startsWith(HOME)) display = "~" + display.slice(HOME.length);
 
       // Compact timestamp: "14:32" (today) or "Mar 5 14:32" (older)
@@ -4926,7 +4998,7 @@ function renderHelpView(width, height) {
   lines.push("");
   lines.push(BOLD + "  Tabs:" + RESET);
   lines.push("    Tab              Cycle bottom panel tabs");
-  lines.push("    1, 2, 3, 4, 5    Switch to Info/Cost/System/Tools/Config");
+  lines.push("    1-6              Switch to Info/Performance/Processes/Tool Activity/Cost/Config");
   lines.push("    Shift+Tab / `    Toggle Live filter (show only running sessions)");
   lines.push("");
   lines.push(BOLD + "  Other:" + RESET);
@@ -5014,6 +5086,135 @@ function renderDeleteConfirm(session, width) {
   const botLine    = border + "╰" + "─".repeat(inner) + "╯" + RESET;
 
   return { lines: [topLine, titleLine, sepLine, nameLine, emptyLine, hintLine, botLine], boxLeft, modalW };
+}
+
+// ---------------------------------------------------------------------------
+// Render: processes panel (top-like per-process list for running session)
+// ---------------------------------------------------------------------------
+
+function renderProcessesPanel(session, panelW, rows, state) {
+  const lines = [];
+  const inner = panelW - 4;
+
+  if (!session || !session.process) {
+    lines.push(C.dimText + "Performance data is only available for running sessions" + RESET);
+    while (lines.length < rows) lines.push("");
+    return lines;
+  }
+
+  const pm = session.process;
+  const procs = (pm.processList || []).slice();
+
+  if (procs.length === 0) {
+    lines.push(C.dimText + "No process data available" + RESET);
+    while (lines.length < rows) lines.push("");
+    return lines;
+  }
+
+  // Column widths
+  const pidW  = 7;
+  const cpuW  = 6;
+  const memW  = 8;
+  const cmdW  = Math.max(10, inner - pidW - cpuW - memW - 3); // 3 gaps
+
+  // Sort
+  const sortKey = state ? state.procSort : "cpu";
+  const desc    = state ? state.procSortDesc : true;
+  procs.sort((a, b) => {
+    let av, bv;
+    if (sortKey === "pid") { av = a.pid; bv = b.pid; }
+    else if (sortKey === "cpu") { av = a.cpu; bv = b.cpu; }
+    else if (sortKey === "mem") { av = a.memory; bv = b.memory; }
+    else { av = a.args; bv = b.args; }
+    if (av < bv) return desc ? 1 : -1;
+    if (av > bv) return desc ? -1 : 1;
+    return 0;
+  });
+
+  // Header row
+  const sortArrow = desc ? "▼" : "▲";
+  const hPid  = (sortKey === "pid"  ? C.hdrLabel + sortArrow : C.dimText + " ") + "PID".padStart(pidW - 1)  + RESET;
+  const hCpu  = (sortKey === "cpu"  ? C.hdrLabel + sortArrow : C.dimText + " ") + "CPU%".padStart(cpuW - 1) + RESET;
+  const hMem  = (sortKey === "mem"  ? C.hdrLabel + sortArrow : C.dimText + " ") + "MEM".padStart(memW - 1)  + RESET;
+  const hCmd  = (sortKey === "cmd"  ? C.hdrLabel + sortArrow : C.dimText + " ") + "COMMAND" + RESET;
+  const headerLine = hPid + "  " + hCpu + "  " + hMem + "  " + hCmd;
+  lines.push(headerLine);
+  if (state) state._procHeaderRow = 1; // relative to panel content
+
+  const ruleColor = "\x1b[38;5;238m";
+  lines.push(ruleColor + "─".repeat(Math.min(inner, pidW + cpuW + memW + 20)) + RESET);
+
+  // Process rows
+  for (const p of procs) {
+    const cpu = p.cpu;
+    const memMB = p.memory / (1024 * 1024);
+    const cpuColor = p.ghost ? C.dimText : cpu > 80 ? C.chartBarHi : cpu > 40 ? C.chartBarMed : cpu > 5 ? C.chartBarLow : C.dimText;
+    const memColor = p.ghost ? C.dimText : memMB > 500 ? C.costRed : memMB > 100 ? C.costYellow : C.dimText;
+    const pidColor = p.ghost ? C.dimText : p.isRoot ? C.hdrLabel : C.dimText;
+    const cmdColor = p.ghost ? C.dimText : p.isRoot ? C.hdrValue : "\x1b[38;5;250m";
+
+    // Derive short process name from args (basename of first token)
+    const firstToken = (p.args || "").split(" ")[0];
+    const procName = firstToken.replace(/.*[/\\]/, "");
+    const rest = p.args.slice(firstToken.length).trimStart();
+    const cmd = (procName + (rest ? " " + rest : "")).slice(0, cmdW);
+
+    const pidStr  = String(p.pid).padStart(pidW);
+    const cpuStr  = (cpu.toFixed(1) + "%").padStart(cpuW);
+    const memStr  = (memMB >= 1000 ? (memMB / 1024).toFixed(1) + "G"
+                    : memMB >= 1 ? memMB.toFixed(0) + "M"
+                    : (p.memory / 1024).toFixed(0) + "K").padStart(memW);
+
+    lines.push(
+      pidColor + pidStr + RESET + "  " +
+      cpuColor + cpuStr + RESET + "  " +
+      memColor + memStr + RESET + "  " +
+      cmdColor + cmd + RESET
+    );
+  }
+
+  // Scroll
+  const contentRows = rows; // header(1) + rule(1) + procs
+  const allLines = lines;
+  const maxScroll = Math.max(0, allLines.length - contentRows);
+  const scroll = state ? Math.min(state.procScroll, maxScroll) : 0;
+  if (state) state.procScroll = scroll;
+
+  const visible = allLines.slice(scroll, scroll + contentRows);
+  while (visible.length < contentRows) visible.push("");
+  return visible;
+}
+
+// ---------------------------------------------------------------------------
+// Render: can't-delete-live-session modal
+// ---------------------------------------------------------------------------
+
+function renderDeleteLiveBlocked(session, width) {
+  const modalW = Math.min(60, width - 6);
+  const boxLeft = Math.floor((width - modalW) / 2);
+  const border = "\x1b[38;5;214;48;5;58m"; // amber on dark-yellow
+  const labelC = "\x1b[1;38;5;221;48;5;58m";
+  const bodyC  = "\x1b[38;5;252;48;5;58m";
+  const hintC  = "\x1b[38;5;245;48;5;58m";
+  const inner  = modalW - 2;
+
+  const pad = (s) => {
+    const plain = s.replace(/\x1b\[[^m]*m/g, "");
+    return s + " ".repeat(Math.max(0, inner - plain.length));
+  };
+
+  const name = (session.list_label || session.label || session.session_id || "").slice(0, inner - 4);
+  const topLine   = border + "╭" + "─".repeat(inner) + "╮" + RESET;
+  const titleLine = border + "│" + RESET + labelC + pad("  Session is running") + RESET + border + "│" + RESET;
+  const sepLine   = border + "├" + "─".repeat(inner) + "┤" + RESET;
+  const nameLine  = border + "│" + RESET + bodyC + pad("  " + name) + RESET + border + "│" + RESET;
+  const emptyLine = border + "│" + " ".repeat(inner) + "│" + RESET;
+  const bodyLine  = border + "│" + RESET + bodyC + pad("  Cannot delete a session that is currently running.") + RESET + border + "│" + RESET;
+  const body2Line = border + "│" + RESET + bodyC + pad("  Stop the agent first, then delete.") + RESET + border + "│" + RESET;
+  const hintLine  = border + "│" + RESET + hintC + pad("  [Esc / any key] dismiss") + RESET + border + "│" + RESET;
+  const botLine   = border + "╰" + "─".repeat(inner) + "╯" + RESET;
+
+  return { lines: [topLine, titleLine, sepLine, nameLine, emptyLine, bodyLine, body2Line, emptyLine, hintLine, botLine], boxLeft, modalW };
 }
 
 // ---------------------------------------------------------------------------
@@ -5344,9 +5545,32 @@ function render(state) {
 
   // Overlay delete confirmation
   if (state.mode === "delete") {
-    const sel = state.sessions[state.selectedRow];
+    const sel = state.filtered[state.selectedRow];
     if (sel) {
       const dm = renderDeleteConfirm(sel, width);
+      const startRow = Math.max(0, Math.floor((screenLines.length - dm.lines.length) / 2));
+      for (let r = 0; r < screenLines.length; r++) {
+        const relRow = r - startRow;
+        if (relRow >= 0 && relRow < dm.lines.length) {
+          const overlay = dm.lines[relRow];
+          const bgLine = screenLines[r] || "";
+          const bgPlain = bgLine.replace(/\x1b\[[^m]*m/g, "");
+          const left = ansiSlice(bgLine, 0, dm.boxLeft);
+          const rightStart = dm.boxLeft + dm.modalW;
+          const right = rightStart < bgPlain.length
+            ? ansiSlice(bgLine, rightStart, width - rightStart)
+            : " ".repeat(Math.max(0, width - rightStart));
+          screenLines[r] = left + overlay + right + RESET;
+        }
+      }
+    }
+  }
+
+  // Overlay delete-blocked modal (live session)
+  if (state.mode === "delete_live") {
+    const sel = state.filtered[state.selectedRow];
+    if (sel) {
+      const dm = renderDeleteLiveBlocked(sel, width);
       const startRow = Math.max(0, Math.floor((screenLines.length - dm.lines.length) / 2));
       for (let r = 0; r < screenLines.length; r++) {
         const relRow = r - startRow;
@@ -5749,6 +5973,11 @@ function handleEvent(event, state) {
     return;
   }
 
+  // --- Delete blocked (live session) modal ---
+  if (state.mode === "delete_live") {
+    state.mode = "list"; state.dirty = true; return;
+  }
+
   // --- Delete confirm mode ---
   if (state.mode === "delete") {
     if (event.type === "ctrl_c" || event.type === "f10") { state.quit = true; return; }
@@ -5792,7 +6021,7 @@ function handleEvent(event, state) {
         case "q": state.quit = true; return;
         case "k": event.type = "up"; break;
         case "j": event.type = "down"; break;
-        case "l": event.type = "enter"; break;
+        // case "l": event.type = "enter"; break; // detail view disabled
         case "/": state.mode = "search"; state.dirty = true; return;
         case "?": case "h": state.mode = "help"; state.dirty = true; return;
         case ">": openSortBy(state); return;
@@ -5800,7 +6029,8 @@ function handleEvent(event, state) {
         case "r": state._needsRefresh = true; return;
         case "d": {
           const sel = state.filtered[state.selectedRow];
-          if (sel && !sel.process) { state.mode = "delete"; state.dirty = true; }
+          if (sel && sel.process) { state.mode = "delete_live"; state.dirty = true; }
+          else if (sel) { state.mode = "delete"; state.dirty = true; }
           return;
         }
         case "P": setSortColumn(state, "status"); return;
@@ -5811,6 +6041,7 @@ function handleEvent(event, state) {
         case "3": state.bottomTab = 2; state.dirty = true; saveUiPrefs({ bottomTab: 2, listTab: state.listTab }); return;
         case "4": state.bottomTab = 3; state.dirty = true; saveUiPrefs({ bottomTab: 3, listTab: state.listTab }); return;
         case "5": state.bottomTab = 4; state.dirty = true; saveUiPrefs({ bottomTab: 4, listTab: state.listTab }); return;
+        case "6": state.bottomTab = 5; state.dirty = true; saveUiPrefs({ bottomTab: 5, listTab: state.listTab }); return;
         case "`": switchListTab(state); return;
         default: return;
       }
@@ -5879,11 +6110,15 @@ function handleEvent(event, state) {
       return;
     }
     case "scroll_up":
-      if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
-        if (state.costScroll > 0) { state.costScroll--; state.dirty = true; }
-      } else if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
-        if (state.configScroll > 0) { state.configScroll--; state.dirty = true; }
+      if (state.bottomTab === 0 && state._configPanelTop && event.row >= state._configPanelTop) {
+        if (state.infoScroll > 0) { state.infoScroll--; state.dirty = true; }
       } else if (state.bottomTab === 2 && state._configPanelTop && event.row >= state._configPanelTop) {
+        if (state.procScroll > 0) { state.procScroll--; state.dirty = true; }
+      } else if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
+        if (state.costScroll > 0) { state.costScroll--; state.dirty = true; }
+      } else if (state.bottomTab === 5 && state._configPanelTop && event.row >= state._configPanelTop) {
+        if (state.configScroll > 0) { state.configScroll--; state.dirty = true; }
+      } else if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
         const hoverCol = event.col - 2;
         if (hoverCol >= 0 && hoverCol <= (state._agentTabWidth || 14)) {
           // Scroll sidebar
@@ -5896,11 +6131,15 @@ function handleEvent(event, state) {
       }
       return;
     case "scroll_down":
-      if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
-        state.costScroll++; state.dirty = true; // clamped in render
-      } else if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
-        state.configScroll++; state.dirty = true; // clamped in render
+      if (state.bottomTab === 0 && state._configPanelTop && event.row >= state._configPanelTop) {
+        state.infoScroll++; state.dirty = true; // clamped in render
       } else if (state.bottomTab === 2 && state._configPanelTop && event.row >= state._configPanelTop) {
+        state.procScroll++; state.dirty = true; // clamped in render
+      } else if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
+        state.costScroll++; state.dirty = true; // clamped in render
+      } else if (state.bottomTab === 5 && state._configPanelTop && event.row >= state._configPanelTop) {
+        state.configScroll++; state.dirty = true; // clamped in render
+      } else if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
         const hoverCol = event.col - 2;
         if (hoverCol >= 0 && hoverCol <= (state._agentTabWidth || 14)) {
           state.agentTabScroll++; state.dirty = true; // clamped in render
@@ -5913,14 +6152,7 @@ function handleEvent(event, state) {
       return;
 
     case "enter":
-      if (listLen > 0 && state.filtered[state.selectedRow]) {
-        state.detailSession = state.filtered[state.selectedRow];
-        state.mode = "detail";
-        state.dirty = true;
-        // Data will be loaded asynchronously in the event loop
-        state._needsDetailLoad = true;
-      }
-      return;
+      return; // detail view disabled
 
     case "click": {
       // Check footer row FIRST — panel handlers use >= _configPanelTop and would swallow the footer row
@@ -5995,7 +6227,7 @@ function handleEvent(event, state) {
         }
       }
       // Check if click is in Tool Activity panel
-      if (state.bottomTab === 2 && state._configPanelTop && event.row >= state._configPanelTop) {
+      if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
         const clickCol = event.col - 2; // adjust for panel border "│ "
         // Click on vertical tab sidebar
@@ -6057,8 +6289,51 @@ function handleEvent(event, state) {
         }
         return; // consume clicks in agent panel area
       }
+      // Check if click is in Processes panel header (sort by column)
+      if (state.bottomTab === 2 && state._configPanelTop && event.row >= state._configPanelTop) {
+        const rowInPanel = event.row - state._configPanelTop;
+        if (rowInPanel === 0) { // header row
+          const pidW = 7, cpuW = 6, memW = 8;
+          const col = event.col - 2; // subtract box padding
+          if (col >= 0 && col < pidW) {
+            if (state.procSort === "pid") state.procSortDesc = !state.procSortDesc;
+            else { state.procSort = "pid"; state.procSortDesc = true; }
+          } else if (col >= pidW + 2 && col < pidW + 2 + cpuW) {
+            if (state.procSort === "cpu") state.procSortDesc = !state.procSortDesc;
+            else { state.procSort = "cpu"; state.procSortDesc = true; }
+          } else if (col >= pidW + cpuW + 4 && col < pidW + cpuW + 4 + memW) {
+            if (state.procSort === "mem") state.procSortDesc = !state.procSortDesc;
+            else { state.procSort = "mem"; state.procSortDesc = true; }
+          } else if (col >= pidW + cpuW + memW + 6) {
+            if (state.procSort === "cmd") state.procSortDesc = !state.procSortDesc;
+            else { state.procSort = "cmd"; state.procSortDesc = false; }
+          }
+          state.dirty = true;
+          return;
+        }
+      }
+      // Check if click is in Info panel scrollbar
+      if (state.bottomTab === 0 && state._configPanelTop && event.row >= state._configPanelTop) {
+        const rowInPanel = event.row - state._configPanelTop;
+        const sb = state._infoScrollbar;
+        if (sb && event.col === sb.col) {
+          if (rowInPanel >= sb.thumbStart && rowInPanel < sb.thumbEnd) {
+            state._infoScrollbarDrag = true;
+            state._infoDragStartRow = rowInPanel;
+            state._infoDragStartScroll = state.infoScroll;
+            state.dirty = true;
+          } else if (rowInPanel < sb.thumbStart) {
+            state.infoScroll = Math.max(0, state.infoScroll - sb.rows);
+            state.dirty = true;
+          } else {
+            state.infoScroll = Math.min(sb.maxScroll, state.infoScroll + sb.rows);
+            state.dirty = true;
+          }
+          return;
+        }
+      }
       // Check if click is in Cost panel scrollbar
-      if (state.bottomTab === 3 && state._configPanelTop && event.row >= state._configPanelTop) {
+      if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
         const sb = state._costScrollbar;
         if (sb && event.col === sb.col) {
@@ -6078,7 +6353,7 @@ function handleEvent(event, state) {
         }
       }
       // Check if click is in Config panel area
-      if (state.bottomTab === 4 && state._configPanelTop && event.row >= state._configPanelTop) {
+      if (state.bottomTab === 5 && state._configPanelTop && event.row >= state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
         const selected = state.filtered[state.selectedRow];
         const sections = getSessionConfig(selected);
@@ -6160,7 +6435,18 @@ function handleEvent(event, state) {
       // Track hover over config sub-tabs and scrollbar
       let newConfigHover = -1;
       let newScrollHover = false;
-      if (state.bottomTab === 3 && state._configPanelTop) {
+      if (state.bottomTab === 0 && state._configPanelTop) {
+        const rowInPanel = event.row - state._configPanelTop;
+        const sb = state._infoScrollbar;
+        if (sb && event.col === sb.col && rowInPanel >= sb.thumbStart && rowInPanel < sb.thumbEnd) {
+          newScrollHover = true;
+        }
+        if (newScrollHover !== state._infoScrollbarHover) {
+          state._infoScrollbarHover = newScrollHover;
+          state.dirty = true;
+        }
+      }
+      if (state.bottomTab === 4 && state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
         const sb = state._costScrollbar;
         if (sb && event.col === sb.col && rowInPanel >= sb.thumbStart && rowInPanel < sb.thumbEnd) {
@@ -6171,7 +6457,7 @@ function handleEvent(event, state) {
           state.dirty = true;
         }
       }
-      if (state.bottomTab === 4 && state._configPanelTop) {
+      if (state.bottomTab === 5 && state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
         const selected = state.filtered[state.selectedRow];
         const sections = getSessionConfig(selected);
@@ -6186,7 +6472,7 @@ function handleEvent(event, state) {
       // Track hover over agent tool tabs and arrows (vertical sidebar)
       let newAgentToolHover = -1;
       let newAgentArrowHover = "";
-      if (state.bottomTab === 2 && state._configPanelTop) {
+      if (state.bottomTab === 3 && state._configPanelTop) {
         const rowInPanel = event.row - state._configPanelTop;
         const hoverCol = event.col - 2;
         if (hoverCol >= 0 && hoverCol <= (state._agentTabWidth || 14)) {
@@ -6235,6 +6521,17 @@ function handleEvent(event, state) {
     }
 
     case "drag": {
+      if (state._infoScrollbarDrag && state._infoScrollbar && state._configPanelTop) {
+        const sb = state._infoScrollbar;
+        const rowInPanel = event.row - state._configPanelTop;
+        const delta = rowInPanel - state._infoDragStartRow;
+        const track = sb.rows - sb.thumbSize;
+        if (track > 0) {
+          const scrollDelta = Math.round((delta / track) * sb.maxScroll);
+          state.infoScroll = Math.max(0, Math.min(sb.maxScroll, state._infoDragStartScroll + scrollDelta));
+          state.dirty = true;
+        }
+      }
       if (state._costScrollbarDrag && state._costScrollbar && state._configPanelTop) {
         const sb = state._costScrollbar;
         const rowInPanel = event.row - state._configPanelTop;
@@ -6262,6 +6559,10 @@ function handleEvent(event, state) {
     }
 
     case "mouseup": {
+      if (state._infoScrollbarDrag) {
+        state._infoScrollbarDrag = false;
+        state.dirty = true;
+      }
       if (state._costScrollbarDrag) {
         state._costScrollbarDrag = false;
         state.dirty = true;
@@ -6439,6 +6740,7 @@ async function loadSessions(state) {
     const key = `${s.provider}:${s.session_id}`;
     const pm = state._processMetrics.get(key);
     if (pm) {
+      applyProcLinger(key, pm);
       s.process = pm;
       matchedKeys.add(key);
       // Push history here (not in renderSystemPanel) so charts accumulate
@@ -6745,6 +7047,8 @@ async function main() {
     if (panelSel && panelSel.session_id !== state._panelSessionId) {
       state._panelSessionId = panelSel.session_id;
       state.panelData = null; // show "Loading..." immediately
+      state.infoScroll = 0;
+      state.procScroll = 0;
       state.costScroll = 0;
       state.configScroll = 0;
       state.configSubTab = 0;

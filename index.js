@@ -2756,6 +2756,8 @@ async function fetchQuota() {
 const TIER2_INTERVAL_TICKS = 1; // collect every loadSessions tick
 const LSOF_CHUNK_SIZE = 50;
 const PID_TREE_TTL_MS = 15_000; // cache subtree PIDs for 15s
+const PROC_LINGER_TICKS = 3; // keep exited sub-processes visible for N collection cycles
+const _procGhostCache = new Map(); // sessionKey → Map<pid, { entry, remaining }>
 
 // Minimal pidusage: runs ps to get CPU% and RSS for a set of PIDs.
 function pidusage(pids) {
@@ -2835,7 +2837,7 @@ function bfsDescendants(rootPid, childrenByPpid) {
 }
 
 // Extract session UUID from Claude/Codex command line args.
-const RESUME_UUID_RE = /--resume\s+([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})/;
+const RESUME_UUID_RE = /\bresume\s+([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})/;
 const CLAUDE_CMD_RE = /\bclaude\b/;
 const CODEX_CMD_RE = /\bcodex\b/;
 const DAEMON_RE = /\b(app-server|server|daemon)\b/;
@@ -3192,6 +3194,27 @@ async function collectProcessMetrics(sessions) {
   }
 
   return result;
+}
+
+// Merge recently-exited processes back into processList for PROC_LINGER_TICKS cycles.
+function applyProcLinger(key, pm) {
+  if (!_procGhostCache.has(key)) _procGhostCache.set(key, new Map());
+  const ghost = _procGhostCache.get(key);
+  const currentPids = new Set(pm.processList.map((p) => p.pid));
+  // Refresh cache for still-alive pids
+  for (const p of pm.processList) {
+    ghost.set(p.pid, { entry: { ...p }, remaining: PROC_LINGER_TICKS });
+  }
+  // Re-inject recently exited pids as ghost entries
+  for (const [pid, cached] of ghost) {
+    if (currentPids.has(pid)) continue;
+    if (cached.remaining > 0) {
+      pm.processList.push({ ...cached.entry, ghost: true, cpu: 0 });
+      cached.remaining--;
+    } else {
+      ghost.delete(pid);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -5122,10 +5145,10 @@ function renderProcessesPanel(session, panelW, rows, state) {
   for (const p of procs) {
     const cpu = p.cpu;
     const memMB = p.memory / (1024 * 1024);
-    const cpuColor = cpu > 80 ? C.chartBarHi : cpu > 40 ? C.chartBarMed : cpu > 5 ? C.chartBarLow : C.dimText;
-    const memColor = memMB > 500 ? C.costRed : memMB > 100 ? C.costYellow : C.dimText;
-    const pidColor = p.isRoot ? C.hdrLabel : C.dimText;
-    const cmdColor = p.isRoot ? C.hdrValue : "\x1b[38;5;250m";
+    const cpuColor = p.ghost ? C.dimText : cpu > 80 ? C.chartBarHi : cpu > 40 ? C.chartBarMed : cpu > 5 ? C.chartBarLow : C.dimText;
+    const memColor = p.ghost ? C.dimText : memMB > 500 ? C.costRed : memMB > 100 ? C.costYellow : C.dimText;
+    const pidColor = p.ghost ? C.dimText : p.isRoot ? C.hdrLabel : C.dimText;
+    const cmdColor = p.ghost ? C.dimText : p.isRoot ? C.hdrValue : "\x1b[38;5;250m";
 
     // Derive short process name from args (basename of first token)
     const firstToken = (p.args || "").split(" ")[0];
@@ -5995,7 +6018,7 @@ function handleEvent(event, state) {
         case "q": state.quit = true; return;
         case "k": event.type = "up"; break;
         case "j": event.type = "down"; break;
-        case "l": event.type = "enter"; break;
+        // case "l": event.type = "enter"; break; // detail view disabled
         case "/": state.mode = "search"; state.dirty = true; return;
         case "?": case "h": state.mode = "help"; state.dirty = true; return;
         case ">": openSortBy(state); return;
@@ -6126,14 +6149,7 @@ function handleEvent(event, state) {
       return;
 
     case "enter":
-      if (listLen > 0 && state.filtered[state.selectedRow]) {
-        state.detailSession = state.filtered[state.selectedRow];
-        state.mode = "detail";
-        state.dirty = true;
-        // Data will be loaded asynchronously in the event loop
-        state._needsDetailLoad = true;
-      }
-      return;
+      return; // detail view disabled
 
     case "click": {
       // Check footer row FIRST — panel handlers use >= _configPanelTop and would swallow the footer row
@@ -6721,6 +6737,7 @@ async function loadSessions(state) {
     const key = `${s.provider}:${s.session_id}`;
     const pm = state._processMetrics.get(key);
     if (pm) {
+      applyProcLinger(key, pm);
       s.process = pm;
       matchedKeys.add(key);
       // Push history here (not in renderSystemPanel) so charts accumulate

@@ -2731,6 +2731,14 @@ async function fetchCodexQuota() {
       };
     }
     result.limit_reached = rl.limit_reached || false;
+    const crl = data.code_review_rate_limit;
+    if (crl && crl.primary_window) {
+      result.code_review = {
+        pct: crl.primary_window.used_percent || 0,
+        resets_at: crl.primary_window.reset_at || null,
+      };
+      if (crl.limit_reached) result.limit_reached = true;
+    }
     return result;
   } catch { return null; }
 }
@@ -3630,18 +3638,29 @@ function renderLimitsPanel(width, state) {
     if (q.seven_day) windows.push({ label: "7d", pct: q.seven_day.pct, reset: q.seven_day.resets_at });
     if (q.primary) windows.push({ label: "5h", pct: q.primary.pct, reset: q.primary.resets_at });
     if (q.secondary) windows.push({ label: "7d", pct: q.secondary.pct, reset: q.secondary.resets_at });
+    if (q.code_review) windows.push({ label: "cr", pct: q.code_review.pct, reset: q.code_review.resets_at });
+    const planPlain = q.plan ? ` (${q.plan})` : "";
     const planStr = q.plan ? ` ${C.dimText}(${q.plan})${RESET}` : "";
     let parts = `${C.hdrLabel}${provLabel}${RESET}${planStr}`;
-    for (const w of windows) {
+    // Each window needs at minimum: " XX YYY%" = 8 visible chars.
+    // Remaining space is shared equally as bar width (capped at 8).
+    const fixedVis = provLabel.length + planPlain.length + windows.length * 8;
+    const spare = colW - fixedVis;
+    const barW = windows.length > 0 ? Math.max(0, Math.min(8, Math.floor(spare / windows.length))) : 0;
+    // Show reset time for the most-used window only, and only if space allows.
+    const showResetIdx = spare - windows.length * barW >= 7
+      ? windows.reduce((best, w, i) => w.pct > windows[best].pct ? i : best, 0)
+      : -1;
+    for (let i = 0; i < windows.length; i++) {
+      const w = windows[i];
       const color = w.pct >= 90 ? C.costRed : w.pct >= 70 ? C.costYellow : C.chartBarLow;
-      const barW = 8;
       const filled = Math.round((w.pct / 100) * barW);
       let bar = "";
       for (let b = 0; b < barW; b++) {
         bar += (b < filled ? color + "━" : "\x1b[38;5;244m─") + RESET;
       }
       let resetStr = "";
-      if (w.reset) {
+      if (i === showResetIdx && w.reset) {
         const resetMs = w.reset > 1e12 ? w.reset : w.reset * 1000;
         const diffMs = resetMs - Date.now();
         if (diffMs > 0) {

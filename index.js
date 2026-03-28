@@ -3737,7 +3737,7 @@ function renderColumnHeaders(state, width) {
     const w = col.flex ? Math.max(8, totalW - used) : col.width;
     let label = col.label;
     if (col.key === state.sortCol) {
-      label += state.sortAsc ? "^" : "v";
+      label += state.sortAsc ? "▲" : "▼";
     }
     label = padOrClip(label, w, col.align);
     line += label;
@@ -4752,13 +4752,13 @@ function renderAgentPanel(session, data, panelW, rows, state) {
     if (isUpArrow) {
       const isHoverArrow = state._hoverAgentArrow === "up";
       const arrowStyle = isHoverArrow ? "\x1b[1;38;5;255m" : C.dimText;
-      const arrow = arrowStyle + " ".repeat(Math.floor(AGENT_TAB_WIDTH / 2) - 1) + "^" + RESET;
+      const arrow = arrowStyle + " ".repeat(Math.floor(AGENT_TAB_WIDTH / 2) - 1) + "▲" + RESET;
       line += arrow + " ".repeat(Math.max(0, AGENT_TAB_WIDTH - Math.floor(AGENT_TAB_WIDTH / 2)));
       state._agentUpArrowRow = r;
     } else if (isDownArrow) {
       const isHoverArrow = state._hoverAgentArrow === "down";
       const arrowStyle = isHoverArrow ? "\x1b[1;38;5;255m" : C.dimText;
-      const arrow = arrowStyle + " ".repeat(Math.floor(AGENT_TAB_WIDTH / 2) - 1) + "v" + RESET;
+      const arrow = arrowStyle + " ".repeat(Math.floor(AGENT_TAB_WIDTH / 2) - 1) + "▼" + RESET;
       line += arrow + " ".repeat(Math.max(0, AGENT_TAB_WIDTH - Math.floor(AGENT_TAB_WIDTH / 2)));
       state._agentDownArrowRow = r;
     } else if (tabIdx < toolList.length) {
@@ -5191,7 +5191,7 @@ function renderProcessesPanel(session, panelW, rows, state) {
   });
 
   // Header row
-  const sortArrow = desc ? "v" : "^";
+  const sortArrow = desc ? "▼" : "▲";
   const hPid  = (sortKey === "pid"  ? C.hdrLabel + sortArrow : C.dimText + " ") + "PID".padStart(pidW - 1)  + RESET;
   const hCpu  = (sortKey === "cpu"  ? C.hdrLabel + sortArrow : C.dimText + " ") + "CPU%".padStart(cpuW - 1) + RESET;
   const hMem  = (sortKey === "mem"  ? C.hdrLabel + sortArrow : C.dimText + " ") + "MEM".padStart(memW - 1)  + RESET;
@@ -5301,7 +5301,7 @@ function renderSortBySidebar(state, width, height) {
     const isActive = col.key === state.sortCol;
     const isCursor = i === state.sortbyIdx;
     let label = col.label;
-    if (isActive) label += state.sortAsc ? " ^" : " v";
+    if (isActive) label += state.sortAsc ? " ▲" : " ▼";
     label = padOrClip(label, sidebarW - 2, "left");
     if (isCursor) {
       items.push(C.selBg + " " + label + " " + RESET);
@@ -5710,7 +5710,8 @@ function render(state) {
   }
 
   // Write all lines (clip to width-1 to prevent terminal right-edge wrapping)
-  for (const line of screenLines) buf += ansiSlice(line, 0, boxW) + "\x1b[K\n";
+  // RESET before \x1b[K so erase-to-EOL uses default background, not selection color
+  for (const line of screenLines) buf += ansiSlice(line, 0, boxW) + RESET + "\x1b[K\n";
 
   // Footer + clear any stale lines below
   state._footerRow = screenLines.length + 1; // 1-based

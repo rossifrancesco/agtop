@@ -2992,9 +2992,20 @@ async function collectProcessMetricsWindows(sessions) {
     const args = info.args || "";
     const name = info.name || ""; // e.g. "claude.exe", "node.exe", "codex.exe"
     // Detect by process name (reliable) or by script path for Node-hosted codex.
-    const isClaudeProc = name === "claude.exe" || name === "claude";
-    const isCodexProc  = name === "codex.exe"
-      || (name === "node.exe" && args.includes("codex") && !args.includes("agtop"));
+    // Exclude .app bundles (Desktop apps and their helpers)
+    const isAppBundle = /\.app[/\\]/.test(args);
+    const isClaudeProc = (name === "claude.exe" || name === "claude") && !isAppBundle;
+    let isCodexNode = false;
+    if (name === "node.exe" && !isAppBundle) {
+      const tokens = args.split(/\s+/);
+      for (let t = 1; t < tokens.length && t < 4; t++) {
+        if (tokens[t].startsWith("-")) continue;
+        const scriptBase = tokens[t].replace(/.*[/\\]/, "").replace(/\.js$/, "").toLowerCase();
+        if (scriptBase === "codex") { isCodexNode = true; break; }
+        break;
+      }
+    }
+    const isCodexProc = ((name === "codex.exe" || name === "codex") && !isAppBundle) || isCodexNode;
     if (!isClaudeProc && !isCodexProc) continue;
     if (DAEMON_RE.test(args)) continue;
 
@@ -3099,10 +3110,21 @@ async function collectProcessMetrics(sessions) {
     // Extract basename of argv[0] — reliable regardless of install path.
     const argv0 = args.split(" ")[0];
     const base = argv0.replace(/.*[/\\]/, "").replace(/\.js$/, "").toLowerCase();
-    const isClaudeProc = base === "claude";
-    // Node-hosted codex: argv[0] is "node" and script path contains "codex"
-    const isCodexProc = base === "codex"
-      || (base === "node" && args.includes("codex") && !args.includes("agtop"));
+    // Exclude macOS .app bundles (Claude Desktop / Codex Desktop and their helpers)
+    const isAppBundle = /\.app[/\\]/.test(args);
+    const isClaudeProc = base === "claude" && !isAppBundle;
+    // Node-hosted codex: check that the script argument (not just any path) is "codex"
+    let isCodexNode = false;
+    if (base === "node" && !isAppBundle) {
+      const tokens = args.split(/\s+/);
+      for (let t = 1; t < tokens.length && t < 4; t++) {
+        if (tokens[t].startsWith("-")) continue; // skip flags
+        const scriptBase = tokens[t].replace(/.*[/\\]/, "").replace(/\.js$/, "").toLowerCase();
+        if (scriptBase === "codex") { isCodexNode = true; break; }
+        break; // only check first non-flag argument (the script)
+      }
+    }
+    const isCodexProc = (base === "codex" && !isAppBundle) || isCodexNode;
     if (!isClaudeProc && !isCodexProc) continue;
     if (DAEMON_RE.test(args)) continue; // skip background daemons (e.g. codex app-server)
 

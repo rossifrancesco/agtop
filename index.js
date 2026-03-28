@@ -2459,7 +2459,7 @@ const LIST_TABS = ["Sessions"]; // Single unified list
 // Shared column defs
 const COL_STATUS = {
   key: "status", label: " ", width: 1, align: "left",
-  desc: "Running status: ● running, ○ stopped",
+  desc: "Running status: ● running (bright=recent, dark=idle), ○ stopped",
   render: (s) => s.process ? "●" : "○",
   compare: (a, b) => (a.process ? 1 : 0) - (b.process ? 1 : 0),
 };
@@ -2849,8 +2849,6 @@ const RESUME_UUID_RE = /\bresume\s+([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})
 // Match "claude" / "codex" as a command (binary name), not as part of a path
 // like ~/.claude/projects/... — require start-of-string or "/" before, whitespace
 // or end-of-string after, so ".claude/" in a path does NOT match.
-const CLAUDE_CMD_RE = /(^|\/)claude(\s|$)/;
-const CODEX_CMD_RE = /(^|\/)codex(\s|$)/;
 const DAEMON_RE = /\b(app-server|server|daemon)\b/;
 
 // lsof-based fallback: find session UUID by checking open files.
@@ -2908,7 +2906,7 @@ function psSnapshotWindows() {
   // Single PowerShell call: get all processes with ppid, cmdline, memory, cpu time.
   const script =
     "Get-CimInstance Win32_Process " +
-    "| Select-Object ProcessId,ParentProcessId,CommandLine,WorkingDirectory,CreationDate,WorkingSetSize,KernelModeTime,UserModeTime " +
+    "| Select-Object ProcessId,ParentProcessId,Name,CommandLine,WorkingDirectory,CreationDate,WorkingSetSize,KernelModeTime,UserModeTime " +
     "| ConvertTo-Json -Compress -Depth 1";
   return new Promise((resolve) => {
     const proc = spawn(
@@ -2943,6 +2941,7 @@ function psSnapshotWindows() {
           const createdAt = cdMatch ? parseInt(cdMatch[1], 10) : 0;
           procs.set(pid, {
             ppid: p.ParentProcessId || 0,
+            name: (p.Name || "").toLowerCase(),
             args: p.CommandLine || "",
             cwd: (p.WorkingDirectory || "").replace(/\\/g, "/"),
             createdAt,
@@ -2991,8 +2990,11 @@ async function collectProcessMetricsWindows(sessions) {
 
   for (const [pid, info] of snapshot) {
     const args = info.args || "";
-    const isClaudeProc = CLAUDE_CMD_RE.test(args);
-    const isCodexProc  = CODEX_CMD_RE.test(args);
+    const name = info.name || ""; // e.g. "claude.exe", "node.exe", "codex.exe"
+    // Detect by process name (reliable) or by script path for Node-hosted codex.
+    const isClaudeProc = name === "claude.exe" || name === "claude";
+    const isCodexProc  = name === "codex.exe"
+      || (name === "node.exe" && args.includes("codex") && !args.includes("agtop"));
     if (!isClaudeProc && !isCodexProc) continue;
     if (DAEMON_RE.test(args)) continue;
 
@@ -3094,8 +3096,13 @@ async function collectProcessMetrics(sessions) {
 
   for (const [pid, info] of snapshot) {
     const args = info.args || "";
-    const isClaudeProc = CLAUDE_CMD_RE.test(args);
-    const isCodexProc = CODEX_CMD_RE.test(args);
+    // Extract basename of argv[0] — reliable regardless of install path.
+    const argv0 = args.split(" ")[0];
+    const base = argv0.replace(/.*[/\\]/, "").replace(/\.js$/, "").toLowerCase();
+    const isClaudeProc = base === "claude";
+    // Node-hosted codex: argv[0] is "node" and script path contains "codex"
+    const isCodexProc = base === "codex"
+      || (base === "node" && args.includes("codex") && !args.includes("agtop"));
     if (!isClaudeProc && !isCodexProc) continue;
     if (DAEMON_RE.test(args)) continue; // skip background daemons (e.g. codex app-server)
 
@@ -3637,13 +3644,12 @@ function renderLimitsPanel(width, state) {
     if (q.five_hour) windows.push({ label: "5h", pct: q.five_hour.pct, reset: q.five_hour.resets_at });
     if (q.seven_day) windows.push({ label: "7d", pct: q.seven_day.pct, reset: q.seven_day.resets_at });
     if (q.primary) windows.push({ label: "5h", pct: q.primary.pct, reset: q.primary.resets_at });
-    if (q.secondary) windows.push({ label: "7d", pct: q.secondary.pct, reset: q.secondary.resets_at });
+    // secondary_window.used_percent is a rate-throttle pressure metric, not actual quota — omit.
     if (q.code_review) windows.push({ label: "cr", pct: q.code_review.pct, reset: q.code_review.resets_at });
     const planPlain = q.plan ? ` (${q.plan})` : "";
     const planStr = q.plan ? ` ${C.dimText}(${q.plan})${RESET}` : "";
     let parts = `${C.hdrLabel}${provLabel}${RESET}${planStr}`;
     // Each window needs at minimum: " XX YYY%" = 8 visible chars.
-    // Remaining space is shared equally as bar width (capped at 8).
     const fixedVis = provLabel.length + planPlain.length + windows.length * 8;
     const spare = colW - fixedVis;
     const barW = windows.length > 0 ? Math.max(0, Math.min(8, Math.floor(spare / windows.length))) : 0;
@@ -3775,7 +3781,19 @@ function renderSessionRow(session, index, isSelected, width, now, hScroll, state
     // Per-column coloring (preserved even when selected)
     let colColor = "";
     if (col.key === "status") {
-      colColor = session.process ? C.chartBarLow : C.dimText;
+      if (!session.process) {
+        colColor = C.dimText;
+      } else {
+        // Shade of green by recency: bright = just active, dark = idle but still running.
+        const la = parseTimestamp(session.last_active);
+        const ageSec = la ? Math.max(0, (now.getTime() - la.getTime()) / 1000) : null;
+        if      (ageSec === null) colColor = C.chartBarLow;    // no data: medium green
+        else if (ageSec < 30)   colColor = "\x1b[38;5;82m";   // <30s  bright green
+        else if (ageSec < 300)  colColor = C.chartBarLow;      // <5m   medium green
+        else if (ageSec < 1800) colColor = "\x1b[38;5;71m";   // <30m  muted green
+        else if (ageSec < 7200) colColor = "\x1b[38;5;28m";   // <2h   dark green
+        else                    colColor = "\x1b[38;5;22m";   // 2h+   dim green
+      }
     } else if (col.key === "active") {
       colColor = ageDimColor(session, now);
     } else if (col.key === "model") {
@@ -5689,7 +5707,8 @@ function parseInputSequence(buf) {
   if (mouseMatch) {
     const btn = parseInt(mouseMatch[1], 10);
     const col = parseInt(mouseMatch[2], 10);
-    const row = parseInt(mouseMatch[3], 10);
+    // Windows Terminal / ConPTY reports SGR mouse rows 0-based; add 1 to normalise to 1-based.
+    const row = parseInt(mouseMatch[3], 10) + (process.platform === "win32" ? 1 : 0);
     const release = mouseMatch[4] === "m";
     if (btn === 64) return { type: "scroll_up", col, row };
     if (btn === 65) return { type: "scroll_down", col, row };

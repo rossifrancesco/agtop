@@ -5442,9 +5442,9 @@ function render(state) {
   let buf = SYNC_START + "\x1b[H"; // move cursor to top-left
 
   if (state.mode === "help") {
-    const lines = renderHelpView(width, height);
-    for (const line of lines) buf += line + "\x1b[K\n";
-    buf += renderFooter(state, width);
+    const lines = renderHelpView(width - 1, height);
+    for (const line of lines) buf += ansiSlice(line, 0, width - 1) + "\x1b[K\n";
+    buf += ansiSlice(renderFooter(state, width - 1), 0, width - 1);
     buf += SYNC_END;
     process.stdout.write(buf);
     return;
@@ -5452,9 +5452,9 @@ function render(state) {
 
   if (state.mode === "detail") {
     const plan = state.detailSession.provider === "codex" ? state.codexPlan : state.claudePlan;
-    const lines = renderDetailView(state.detailSession, state.detailData, plan, width, height);
-    for (const line of lines) buf += line + "\x1b[K\n";
-    buf += renderFooter(state, width);
+    const lines = renderDetailView(state.detailSession, state.detailData, plan, width - 1, height);
+    for (const line of lines) buf += ansiSlice(line, 0, width - 1) + "\x1b[K\n";
+    buf += ansiSlice(renderFooter(state, width - 1), 0, width - 1);
     buf += SYNC_END;
     process.stdout.write(buf);
     return;
@@ -5497,7 +5497,7 @@ function render(state) {
   const tabBarLines = renderListTabBar(state, boxW).split("\n");
   for (const tbl of tabBarLines) screenLines.push(tbl);
   state._colHeaderRow = screenLines.length + 1; // 1-based row of column header
-  screenLines.push(renderColumnHeaders(state, width));
+  screenLines.push(renderColumnHeaders(state, boxW));
 
   if (list.length === 0 && state.listTab === 1) {
     // Empty Live tab
@@ -5509,7 +5509,7 @@ function render(state) {
       const idx = state.scrollOffset + i;
       if (idx < list.length) {
         const isSelected = idx === state.selectedRow;
-        screenLines.push(renderSessionRow(list[idx], idx, isSelected, width, now, state.hScroll, state));
+        screenLines.push(renderSessionRow(list[idx], idx, isSelected, boxW, now, state.hScroll, state));
       } else {
         screenLines.push("");
       }
@@ -5687,12 +5687,12 @@ function render(state) {
     }
   }
 
-  // Write all lines (clip to terminal width to prevent wrapping)
-  for (const line of screenLines) buf += ansiSlice(line, 0, width) + "\x1b[K\n";
+  // Write all lines (clip to width-1 to prevent terminal right-edge wrapping)
+  for (const line of screenLines) buf += ansiSlice(line, 0, boxW) + "\x1b[K\n";
 
   // Footer
   state._footerRow = screenLines.length + 1; // 1-based
-  buf += ansiSlice(renderFooter(state, width), 0, width);
+  buf += ansiSlice(renderFooter(state, boxW), 0, boxW);
   buf += SYNC_END;
   process.stdout.write(buf);
 }

@@ -5439,7 +5439,7 @@ function listTabAtX(col, state) {
 function render(state) {
   const width = process.stdout.columns || 100;
   const height = process.stdout.rows || 24;
-  let buf = SYNC_START + "\x1b[H"; // move cursor to top-left
+  let buf = SYNC_START + "\x1b[H" + RESET; // move cursor to top-left, reset colors
 
   if (state.mode === "help") {
     const lines = renderHelpView(width - 1, height);
@@ -5692,7 +5692,7 @@ function render(state) {
 
   // Footer + clear any stale lines below
   state._footerRow = screenLines.length + 1; // 1-based
-  buf += ansiSlice(renderFooter(state, boxW), 0, boxW) + "\x1b[J";
+  buf += ansiSlice(renderFooter(state, boxW), 0, boxW) + RESET + "\x1b[J";
   buf += SYNC_END;
   process.stdout.write(buf);
 }

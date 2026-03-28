@@ -5690,9 +5690,9 @@ function render(state) {
   // Write all lines (clip to width-1 to prevent terminal right-edge wrapping)
   for (const line of screenLines) buf += ansiSlice(line, 0, boxW) + "\x1b[K\n";
 
-  // Footer
+  // Footer + clear any stale lines below
   state._footerRow = screenLines.length + 1; // 1-based
-  buf += ansiSlice(renderFooter(state, boxW), 0, boxW);
+  buf += ansiSlice(renderFooter(state, boxW), 0, boxW) + "\x1b[J";
   buf += SYNC_END;
   process.stdout.write(buf);
 }
@@ -6732,7 +6732,7 @@ function renderGroupedLines(codexSessions, claudeSessions, codexPlan, claudePlan
 // ---------------------------------------------------------------------------
 
 function tuiStartup() {
-  process.stdout.write(ALT_SCREEN_ON + CURSOR_HIDE + MOUSE_ON);
+  process.stdout.write(ALT_SCREEN_ON + "\x1b[2J" + CURSOR_HIDE + MOUSE_ON);
   process.stdin.setRawMode(true);
   process.stdin.resume();
   process.stdin.setEncoding("utf-8");

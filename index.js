@@ -5669,12 +5669,12 @@ function render(state) {
     }
   }
 
-  // Write all lines
-  for (const line of screenLines) buf += line + "\x1b[K\n";
+  // Write all lines (clip to terminal width to prevent wrapping)
+  for (const line of screenLines) buf += ansiSlice(line, 0, width) + "\x1b[K\n";
 
   // Footer
   state._footerRow = screenLines.length + 1; // 1-based
-  buf += renderFooter(state, width);
+  buf += ansiSlice(renderFooter(state, width), 0, width);
   buf += SYNC_END;
   process.stdout.write(buf);
 }

@@ -5730,8 +5730,7 @@ function parseInputSequence(buf) {
   if (mouseMatch) {
     const btn = parseInt(mouseMatch[1], 10);
     const col = parseInt(mouseMatch[2], 10);
-    // Windows Terminal / ConPTY reports SGR mouse rows 0-based; add 1 to normalise to 1-based.
-    const row = parseInt(mouseMatch[3], 10) + (process.platform === "win32" ? 1 : 0);
+    const row = parseInt(mouseMatch[3], 10);
     const release = mouseMatch[4] === "m";
     if (btn === 64) return { type: "scroll_up", col, row };
     if (btn === 65) return { type: "scroll_down", col, row };

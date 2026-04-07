@@ -18,11 +18,16 @@ Your window into what your AI coding agents are actually doing. agtop is a top-s
 - **Cost tracking** -- per-session spend with hourly and daily breakdowns; plan-aware billing (retail, Max, included)
 - **Context pressure** -- CTX% shows how full each agent's context window is
 - **Live toggle** -- filter to running sessions with real-time CPU%, cost rates, and incremental tool counts
+- **Performance panel** -- per-session CPU and memory sparkline charts over time
+- **Processes panel** -- live process tree showing child processes with CPU%, memory, and command lines
 - **Tool Activity panel** -- scrollable per-tool invocation history with timestamps; see exactly what each agent has been doing
-- **OS process metrics** -- CPU% and PID count for running sessions (macOS/Linux)
+- **Cost panel** -- total spend by time window with per-model token and cost breakdown
+- **Config panel** -- browse CLAUDE.md/AGENTS.md, memories, skills, MCP servers, and permissions per session
+- **OS process metrics** -- CPU% and PID count for running sessions (macOS/Linux/Windows)
 - **Overview sparklines** -- aggregate spend, tokens, and CPU charts at a glance
 - **Detail view** -- full cost breakdown, token split, per-model stats, and complete tool history
-- **Config panel** -- browse CLAUDE.md/AGENTS.md, memories, skills, MCP servers, and permissions per session
+- **Session management** -- delete non-running sessions with confirmation
+- **Inactivity filter** -- filter sessions by age (1 day, 1 week, 1 month)
 - **Mouse support** -- click to select, sort by column, switch tabs; hover tooltips on column headers
 - **Non-interactive modes** -- table and full JSON dump for scripting
 
@@ -65,10 +70,14 @@ agtop -d 3
 | `Enter` | Open detail view |
 | `Tab` | Cycle bottom panel tabs |
 | `Shift+Tab` or `` ` `` | Toggle Live filter |
-| `1`/`2`/`3`/`4` | Switch to Info/System/Tool Activity/Config panel |
+| `1`-`6` | Switch to Info/Performance/Processes/Tool Activity/Cost/Config panel |
+| `F1`, `?`, `h` | Show help |
 | `F3` or `/` | Search/filter sessions |
-| `F6` or `>` | Sort-by panel |
 | `F5` or `r` | Force refresh |
+| `F6` or `>` | Sort-by panel |
+| `F7` | Filter sessions by age (1d/1w/1mo) |
+| `P`/`M`/`T` | Sort by Status/Memory/Cost |
+| `d` | Delete selected session (non-running only) |
 | `q` or `F10` | Quit |
 
 ## JSON Output

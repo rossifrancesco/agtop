@@ -86,6 +86,14 @@ agtop -d 3
 
 <img src="screenshots/panel-info.png" width="600" alt="Info panel">
 
+**Performance** — per-session CPU and memory sparkline charts over time
+
+<img src="screenshots/panel-performance.png" width="600" alt="Performance panel">
+
+**Processes** — live process tree with CPU%, memory, and command lines (C++ builds, caffeinate, etc.)
+
+<img src="screenshots/panel-processes.png" width="600" alt="Processes panel">
+
 **Tool Activity** — per-tool invocation counts and live feed with timestamps
 
 <img src="screenshots/panel-tool-activity.png" width="600" alt="Tool Activity panel">

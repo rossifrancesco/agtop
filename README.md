@@ -35,6 +35,8 @@ Your window into what your AI coding agents are actually doing. agtop is a top-s
 
 Requires Node.js >= 18. No other dependencies.
 
+The `npx` command at the top of this page runs agtop without installing it. To install it permanently so `agtop` is always available in your terminal:
+
 ```
 npm install -g @ldegio/agtop
 agtop

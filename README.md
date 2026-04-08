@@ -31,27 +31,23 @@ Your window into what your AI coding agents are actually doing. agtop is a top-s
 - **Mouse support** -- click to select, sort by column, switch tabs; hover tooltips on column headers
 - **Non-interactive modes** -- table and full JSON dump for scripting
 
-## Requirements
+## Install
 
-- Node.js >= 18
-- No dependencies (single-file, pure Node.js)
-
-## Usage
+Requires Node.js >= 18. No other dependencies.
 
 ```
-# Run the TUI (no install needed)
-npx @ldegio/agtop
-
-# Or install globally
 npm install -g @ldegio/agtop
+```
 
-# Run the installed version
+## Run
+
+```
 agtop
+```
 
-# Set refresh interval (seconds)
-agtop -d 3
+## Uninstall
 
-# Uninstall
+```
 npm uninstall -g @ldegio/agtop
 ```
 

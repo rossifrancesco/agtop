@@ -31,7 +31,7 @@ Your window into what your AI coding agents are actually doing. agtop is a top-s
 - **Mouse support** -- click to select, sort by column, switch tabs; hover tooltips on column headers
 - **Non-interactive modes** -- table and full JSON dump for scripting
 
-## Install / Run / Uninstall
+## Setup
 
 Requires Node.js >= 18. No other dependencies.
 

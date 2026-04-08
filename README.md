@@ -5,7 +5,7 @@ Run with:
 npx @ldegio/agtop
 ```
 
-Your window into what your AI coding agents are actually doing. agtop is a top-style terminal dashboard that tracks every Claude Code and Codex session on your machine — spend, token usage, context pressure, CPU load, tool invocations, and more — all in one place, live.
+Your window into what your AI coding agents are doing, sitting in the terminal, where you run them. agtop is a top-style terminal dashboard that tracks every Claude Code and Codex session on your machine — spend, token usage, context pressure, CPU load, tool invocations, and more — all in one place, live.
 
 ![agtop](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
 ![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)
@@ -33,8 +33,6 @@ Your window into what your AI coding agents are actually doing. agtop is a top-s
 
 ## Setup
 
-Requires Node.js >= 18. No other dependencies.
-
 The `npx` command at the top of this page runs agtop without installing it. To install it permanently so `agtop` is always available in your terminal:
 
 ```
@@ -42,6 +40,8 @@ npm install -g @ldegio/agtop
 agtop
 npm uninstall -g @ldegio/agtop
 ```
+
+Requires Node.js >= 18. No other dependencies.
 
 ## Options
 

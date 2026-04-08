@@ -5,7 +5,7 @@ Run with:
 npx @ldegio/agtop
 ```
 
-Your window into what your AI coding agents are doing, sitting in the terminal, where you run them. agtop is a top-style terminal dashboard that tracks every Claude Code and Codex session on your machine — spend, token usage, context pressure, CPU load, tool invocations, and more — all in one place, live.
+Your window into what your AI coding agents are doing, sitting in the terminal, where you run them. agtop is a top-style terminal dashboard that tracks every Claude Code and Codex session on your machine: spend, token usage, context pressure, CPU load, tool invocations, and more. All in one place, live.
 
 ![agtop](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
 ![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)
@@ -82,27 +82,27 @@ Requires Node.js >= 18. No other dependencies.
 
 ## Screenshots
 
-**Info panel** — session identity, wall/API time, context pressure
+**Info panel**: session identity, wall/API time, context pressure
 
 <img src="screenshots/panel-info.png" width="600" alt="Info panel">
 
-**Performance** — per-session CPU and memory sparkline charts over time
+**Performance**: per-session CPU and memory sparkline charts over time
 
 <img src="screenshots/panel-performance.png" width="600" alt="Performance panel">
 
-**Processes** — live process tree with CPU%, memory, and command lines (C++ builds, caffeinate, etc.)
+**Processes**: live process tree with CPU%, memory, and command lines (C++ builds, caffeinate, etc.)
 
 <img src="screenshots/panel-processes.png" width="600" alt="Processes panel">
 
-**Tool Activity** — per-tool invocation counts and live feed with timestamps
+**Tool Activity**: per-tool invocation counts and live feed with timestamps
 
 <img src="screenshots/panel-tool-activity.png" width="600" alt="Tool Activity panel">
 
-**Cost breakdown** — total spend by time window, per-model token and cost split
+**Cost breakdown**: total spend by time window, per-model token and cost split
 
 <img src="screenshots/panel-cost.png" width="600" alt="Cost panel">
 
-**Config** — browse CLAUDE.md, memories, skills, MCP servers, and permissions
+**Config**: browse CLAUDE.md, memories, skills, MCP servers, and permissions
 
 <img src="screenshots/panel-config.png" width="600" alt="Config panel">
 

@@ -47,8 +47,9 @@ import { spawn, execSync } from "node:child_process";
 // ---------------------------------------------------------------------------
 
 const HOME = homedir();
+const CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || join(HOME, ".claude");
 const CODEX_SESSIONS_ROOT = join(HOME, ".codex", "sessions");
-const CLAUDE_PROJECTS_ROOT = join(HOME, ".claude", "projects");
+const CLAUDE_PROJECTS_ROOT = join(CLAUDE_CONFIG_DIR, "projects");
 const UUID_RE = /([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/;
 const FULL_UUID_RE = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const SESSION_DATA_CACHE = new Map();
@@ -900,16 +901,16 @@ function extractClaudeConfig(session) {
     ? basename(dirname(session.data_file))
     : null;
   const projectMemDir = projectName
-    ? join(HOME, ".claude", "projects", projectName, "memory")
+    ? join(CLAUDE_CONFIG_DIR, "projects", projectName, "memory")
     : null;
   const cwd = session.label_source || "";
 
   // 1. CLAUDE.md files
   const claudeMdLines = [];
-  const globalCmPath = join(HOME, ".claude", "CLAUDE.md");
-  const globalCmBlock = formatConfigFile(globalCmPath, "~/.claude/CLAUDE.md");
+  const globalCmPath = join(CLAUDE_CONFIG_DIR, "CLAUDE.md");
+  const globalCmBlock = formatConfigFile(globalCmPath, CLAUDE_CONFIG_DIR + "/CLAUDE.md");
   if (globalCmBlock) claudeMdLines.push(...globalCmBlock);
-  else claudeMdLines.push(notFoundLine("~/.claude/CLAUDE.md not found"));
+  else claudeMdLines.push(notFoundLine(CLAUDE_CONFIG_DIR + "/CLAUDE.md not found"));
 
   if (cwd) {
     const projCmPath = join(cwd, "CLAUDE.md");
@@ -945,7 +946,7 @@ function extractClaudeConfig(session) {
 
   // 3. Skills
   const skillLines = [];
-  const skillsDirPath = join(HOME, ".claude", "skills");
+  const skillsDirPath = join(CLAUDE_CONFIG_DIR, "skills");
   if (dirExists(skillsDirPath)) {
     for (const d of listDir(skillsDirPath)) {
       const skillMd = safeReadFile(join(skillsDirPath, d, "SKILL.md"), 4096);
@@ -960,12 +961,12 @@ function extractClaudeConfig(session) {
       }
     }
   }
-  if (skillLines.length === 0) skillLines.push(notFoundLine("No skills installed (~/.claude/skills/)"));
+  if (skillLines.length === 0) skillLines.push(notFoundLine(`No skills installed (${CLAUDE_CONFIG_DIR}/skills/)`));
   sections.push({ label: "Skills", lines: skillLines, copyPath: skillsDirPath });
 
   // 4. MCP Servers
   const mcpLines = [];
-  const settingsPath = join(HOME, ".claude", "settings.json");
+  const settingsPath = join(CLAUDE_CONFIG_DIR, "settings.json");
   const settingsContent = safeReadFile(settingsPath);
   if (settingsContent) {
     try {
@@ -1001,7 +1002,7 @@ function extractClaudeConfig(session) {
   // 5. Permissions
   const permLines = [];
   const permFiles = [
-    { path: join(HOME, ".claude", "settings.json"), label: "global" },
+    { path: join(CLAUDE_CONFIG_DIR, "settings.json"), label: "global" },
   ];
   if (cwd) {
     permFiles.push({ path: join(cwd, ".claude", "settings.json"), label: "project" });
@@ -1953,7 +1954,7 @@ function extractContextUsage(session) {
       const cwd = session.label_source;
       const settingsFiles = [
         ...(cwd ? [join(cwd, ".claude", "settings.local.json"), join(cwd, ".claude", "settings.json")] : []),
-        join(HOME, ".claude", "settings.json"),
+        join(CLAUDE_CONFIG_DIR, "settings.json"),
       ];
       for (const sf of settingsFiles) {
         try {
@@ -2628,7 +2629,7 @@ function readClaudeCredential() {
   }
   // Fallback: credentials file
   try {
-    const credPath = join(homedir(), ".claude", ".credentials.json");
+    const credPath = join(CLAUDE_CONFIG_DIR, ".credentials.json");
     const cred = JSON.parse(readFileSync(credPath, "utf-8"));
     const tok = cred.accessToken || cred.access_token;
     if (tok) {

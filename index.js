@@ -1319,6 +1319,7 @@ async function extractClaudeSessionData(transcriptPath) {
   const models = {};
   let lastModel = null;
   let lastMainModel = null; // model from main session file only (excludes subagent sidechains)
+  let customTitle = null;
   const metrics = emptyMetrics();
   const seenToolIds = new Set();
   const seenUrls = new Set();
@@ -1336,6 +1337,11 @@ async function extractClaudeSessionData(transcriptPath) {
       // --- System branch: accumulate API duration ---
       if (item.type === "system" && item.subtype === "turn_duration" && item.durationMs) {
         metrics.api_duration_ms += item.durationMs;
+        return;
+      }
+
+      if (item.type === "custom-title" && item.customTitle) {
+        customTitle = item.customTitle;
         return;
       }
 
@@ -1547,6 +1553,7 @@ async function extractClaudeSessionData(transcriptPath) {
     costsByDay,
     costsByHour,
     metrics,
+    customTitle,
     _localDates: true,
     _noSubagentModel: true, // cache bust: lastModel now excludes subagent sidechain files
   };
@@ -4205,8 +4212,14 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows, scrollTop, st
     : C.hdrValue;
   lines.push(`${C.hdrLabel}Type${RESET}       ${provColor}${prov}${RESET}  ${C.hdrLabel}Model${RESET} ${mdlColor}${displayModel}${RESET}`);
   addCopyLine("ID", shortSid, sid, "id", 9);
+  if (data.customTitle) {
+    const maxTitleW = w - 12;
+    const displayTitle = data.customTitle.length > maxTitleW ? data.customTitle.slice(0, maxTitleW - 3) + "..." : data.customTitle;
+    addCopyLine("Title", displayTitle, data.customTitle, "title", 9);
+  }
   {
-    const fullCmd = (pm && pm.command) || (session.provider === "claude" ? `claude --resume ${sid}` : `codex resume ${sid}`);
+    const resumeId = data.customTitle || sid;
+    const fullCmd = (pm && pm.command) || (session.provider === "claude" ? `claude --resume ${resumeId}` : `codex resume ${resumeId}`);
     const maxCmdW = w - 12;
     const cmd = fullCmd.length > maxCmdW ? fullCmd.slice(0, maxCmdW - 3) + "..." : fullCmd;
     addCopyLine("Cmd", cmd, fullCmd, "cmd", 9);
